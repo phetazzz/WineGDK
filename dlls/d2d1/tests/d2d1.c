@@ -10663,6 +10663,244 @@ static ID2D1DeviceContext *create_device_context(ID2D1Factory1 *factory, IDXGIDe
     return device_context;
 }
 
+static HRESULT STDMETHODCALLTYPE command_list_sink_BeginDraw(ID2D1CommandSink *iface)
+{
+    return E_ABORT;
+}
+
+static const ID2D1CommandSinkVtbl command_list_sink_vtbl =
+{
+    .BeginDraw = command_list_sink_BeginDraw,
+};
+
+static void test_command_list_draw(BOOL d3d11)
+{
+    static const D2D1_MATRIX_3X2_F identity = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
+    static const D2D1_COLOR_F red = {1.0f, 0.0f, 0.0f, 1.0f};
+    static const D2D1_COLOR_F blue = {0.0f, 0.0f, 1.0f, 1.0f};
+    static const D2D1_RECT_F rect = {0.0f, 0.0f, 16.0f, 16.0f};
+    ID2D1CommandList *command_list, *nested;
+    D2D1_MATRIX_3X2_F transform, returned;
+    D2D1_RECT_F clip = {0.0f, 0.0f, 12.0f, 16.0f};
+    D2D1_POINT_2F offset = {32.0f, 0.0f};
+    IDWriteRenderingParams *params, *returned_params;
+    IDWriteFactory *write_factory;
+    ID2D1CommandSink sink = {&command_list_sink_vtbl};
+    ID2D1Bitmap *bitmap_iface;
+    struct d2d1_test_context ctx;
+    ID2D1SolidColorBrush *brush;
+    struct resource_readback rb;
+    ID2D1Image *target;
+    D2D1_TAG tag1, tag2;
+    DWORD colour;
+    ULONG refcount;
+    unsigned int i;
+    float dpi_x, dpi_y;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+    if (!ctx.factory1)
+    {
+        win_skip("Command lists are not supported.\n");
+        release_test_context(&ctx);
+        return;
+    }
+
+    ID2D1DeviceContext_GetTarget(ctx.context, &target);
+    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &command_list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Stream(command_list, &sink);
+    ok(hr == D2DERR_WRONG_STATE, "Unexpected Stream result %#lx.\n", hr);
+    bitmap_iface = (void *)0xdeadbeef;
+    hr = ID2D1CommandList_QueryInterface(command_list, &IID_ID2D1Bitmap, (void **)&bitmap_iface);
+    ok(hr == E_NOINTERFACE && !bitmap_iface, "A command list must not expose ID2D1Bitmap, hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)command_list);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_SetAntialiasMode(ctx.context, D2D1_ANTIALIAS_MODE_ALIASED);
+    ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Recording failed, hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(command_list);
+    ok(hr == S_OK, "Close failed, hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Stream(command_list, &sink);
+    ok(hr == E_ABORT, "Stream did not propagate the sink failure, hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Stream(command_list, NULL);
+    ok(hr == E_INVALIDARG, "Unexpected null sink result %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(command_list);
+    ok(hr == D2DERR_WRONG_STATE, "Got hr %#lx.\n", hr);
+
+    /* The brush is captured at recording time. */
+    ID2D1SolidColorBrush_SetColor(brush, &blue);
+    ID2D1DeviceContext_SetTarget(ctx.context, target);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &blue);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Playback failed, hr %#lx.\n", hr);
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 8, 8);
+    ok(colour == 0xffff0000, "Got colour %#lx.\n", colour);
+    colour = get_readback_colour(&rb, 24, 8);
+    ok(colour == 0xff0000ff, "Got background colour %#lx.\n", colour);
+    release_resource_readback(&rb);
+
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &nested);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)nested);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    transform = identity;
+    transform._31 = 16.0f;
+    ID2D1DeviceContext_SetTransform(ctx.context, &transform);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Recording nested list failed, hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(nested);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1CommandList_Release(command_list);
+
+    ID2D1DeviceContext_SetTarget(ctx.context, target);
+    transform._31 = 32.0f;
+    ID2D1DeviceContext_SetTransform(ctx.context, &transform);
+    ID2D1DeviceContext_SetTags(ctx.context, 123, 456);
+    ID2D1DeviceContext_SetAntialiasMode(ctx.context, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &blue);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)nested, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    ID2D1DeviceContext_GetTransform(ctx.context, &returned);
+    ok(!memcmp(&transform, &returned, sizeof(transform)), "Transform was not restored.\n");
+    ID2D1DeviceContext_GetTags(ctx.context, &tag1, &tag2);
+    ok(tag1 == 123 && tag2 == 456, "Tags were not restored.\n");
+    ok(ID2D1DeviceContext_GetAntialiasMode(ctx.context) == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            "Antialias mode was not restored.\n");
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Nested playback failed, hr %#lx.\n", hr);
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 56, 8);
+    ok(colour == 0xffff0000, "Got nested colour %#lx.\n", colour);
+    colour = get_readback_colour(&rb, 8, 8);
+    ok(colour == 0xff0000ff, "Got background colour %#lx.\n", colour);
+    release_resource_readback(&rb);
+
+    refcount = ID2D1CommandList_Release(nested);
+    ok(!refcount, "Got refcount %lu.\n", refcount);
+
+    /* A recorded clear affects the image, not pixels outside it on the destination. */
+    ID2D1DeviceContext_SetTransform(ctx.context, &identity);
+    ID2D1DeviceContext_SetTags(ctx.context, 0, 0);
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &command_list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)command_list);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, NULL);
+    ID2D1DeviceContext_PushAxisAlignedClip(ctx.context, &clip, D2D1_ANTIALIAS_MODE_ALIASED);
+    ID2D1SolidColorBrush_SetColor(brush, &red);
+    ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+    ID2D1DeviceContext_PopAxisAlignedClip(ctx.context);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(command_list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    /* Force command-buffer growth after recording pointers to optional arguments. */
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &nested);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)nested);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, &offset, &rect,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    for (i = 0; i < 4096; ++i)
+        ID2D1DeviceContext_SetTags(ctx.context, i, i);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(nested);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1CommandList_Release(command_list);
+
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory, (IUnknown **)&write_factory);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDWriteFactory_CreateRenderingParams(write_factory, &params);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    IDWriteFactory_Release(write_factory);
+    ID2D1DeviceContext_SetTarget(ctx.context, target);
+    ID2D1DeviceContext_SetTextRenderingParams(ctx.context, params);
+    ID2D1DeviceContext_SetTextAntialiasMode(ctx.context, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    ID2D1DeviceContext_SetPrimitiveBlend(ctx.context, D2D1_PRIMITIVE_BLEND_COPY);
+    ID2D1DeviceContext_SetDpi(ctx.context, 192.0f, 192.0f);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &blue);
+    clip.left = 32.0f;
+    clip.right = 40.0f;
+    ID2D1DeviceContext_PushAxisAlignedClip(ctx.context, &clip, D2D1_ANTIALIAS_MODE_ALIASED);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)nested, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    ID2D1DeviceContext_GetDpi(ctx.context, &dpi_x, &dpi_y);
+    ok(dpi_x == 192.0f && dpi_y == 192.0f, "DPI was not restored.\n");
+    ok(ID2D1DeviceContext_GetPrimitiveBlend(ctx.context) == D2D1_PRIMITIVE_BLEND_COPY,
+            "Primitive blend was not restored.\n");
+    ok(ID2D1DeviceContext_GetUnitMode(ctx.context) == D2D1_UNIT_MODE_DIPS, "Unit mode was not restored.\n");
+    ok(ID2D1DeviceContext_GetTextAntialiasMode(ctx.context) == D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+            "Text antialias mode was not restored.\n");
+    ID2D1DeviceContext_GetTextRenderingParams(ctx.context, &returned_params);
+    ok(returned_params == params, "Text rendering parameters were not restored.\n");
+    if (returned_params) IDWriteRenderingParams_Release(returned_params);
+    ID2D1DeviceContext_PopAxisAlignedClip(ctx.context);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Clipped playback failed, hr %#lx.\n", hr);
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 68, 8);
+    ok(colour == 0xffff0000, "Got clipped colour %#lx.\n", colour);
+    colour = get_readback_colour(&rb, 84, 8);
+    ok(colour == 0xff0000ff, "Destination clip was lost, colour %#lx.\n", colour);
+    colour = get_readback_colour(&rb, 8, 8);
+    ok(colour == 0xff0000ff, "Recorded clear erased the destination, colour %#lx.\n", colour);
+    release_resource_readback(&rb);
+    ID2D1CommandList_Release(nested);
+    ID2D1DeviceContext_SetTextRenderingParams(ctx.context, NULL);
+    IDWriteRenderingParams_Release(params);
+
+    /* An unclosed source fails without altering the destination state or pixels. */
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &command_list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(FAILED(hr), "Expected an unclosed list error.\n");
+    ID2D1DeviceContext_GetDpi(ctx.context, &dpi_x, &dpi_y);
+    ok(dpi_x == 192.0f && dpi_y == 192.0f, "DPI was not restored after failure.\n");
+    ok(ID2D1DeviceContext_GetPrimitiveBlend(ctx.context) == D2D1_PRIMITIVE_BLEND_COPY,
+            "Primitive blend was not restored after failure.\n");
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 68, 8);
+    ok(colour == 0xffff0000, "Failure altered destination pixels, colour %#lx.\n", colour);
+    release_resource_readback(&rb);
+    ID2D1CommandList_Release(command_list);
+
+    /* Reject a cycle before it can acquire a reference to itself. */
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &command_list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)command_list);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(FAILED(hr), "Expected a cycle error.\n");
+    hr = ID2D1CommandList_Close(command_list);
+    ok(FAILED(hr), "Expected Close to reject the invalid list.\n");
+    ID2D1DeviceContext_SetTarget(ctx.context, target);
+    refcount = ID2D1CommandList_Release(command_list);
+    ok(!refcount, "Cycle leaked %lu references.\n", refcount);
+    ID2D1SolidColorBrush_Release(brush);
+    ID2D1Image_Release(target);
+    release_test_context(&ctx);
+}
+
 static void test_command_list(BOOL d3d11)
 {
     static const DWORD bitmap_data[] =
@@ -10876,7 +11114,6 @@ static void test_command_list(BOOL d3d11)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     ID2D1DeviceContext_GetTarget(device_context, &target);
-    todo_wine
     ok(target == NULL, "Unexpected context target.\n");
     if (target) ID2D1Image_Release(target);
 
@@ -10890,7 +11127,6 @@ static void test_command_list(BOOL d3d11)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     hr = ID2D1CommandList_Close(command_list);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     ID2D1CommandList_Release(command_list);
@@ -18219,6 +18455,7 @@ START_TEST(d2d1)
     queue_d3d10_test(test_invert_matrix);
     queue_d3d10_test(test_skew_matrix);
     queue_test(test_command_list);
+    queue_test(test_command_list_draw);
     queue_d3d10_test(test_max_bitmap_size);
     queue_test(test_dpi);
     queue_test(test_unit_mode);

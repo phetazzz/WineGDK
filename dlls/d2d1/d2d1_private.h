@@ -221,6 +221,7 @@ struct d2d_device_context
     struct d2d_clip_stack clip_stack;
 
     struct d2d_indexed_objects vertex_buffers;
+    unsigned int command_list_depth;
 };
 
 HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,
@@ -902,6 +903,8 @@ struct d2d_command_list
     ID2D1Factory *factory;
     enum d2d_command_list_state state;
     unsigned int flags;
+    /* Weak reference, cleared when the context changes target or is destroyed. */
+    struct d2d_device_context *target_context;
 
     size_t size;
     size_t capacity;
