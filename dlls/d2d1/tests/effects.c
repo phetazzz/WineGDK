@@ -169,6 +169,49 @@ static void test_fixture(void)
     cleanup_effect_context(&ctx);
 }
 
+static void test_ignore_alpha_backdrop_blur(void)
+{
+    static const D2D1_VECTOR_4F transparent_red = {1, 0, 0, 0};
+    D2D1_BITMAP_PROPERTIES1 props = {{DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_IGNORE},
+            96, 96, D2D1_BITMAP_OPTIONS_NONE, NULL};
+    struct effect_test_context ctx;
+    ID2D1Bitmap1 *source, *copy;
+    ID2D1Effect *blur;
+    HRESULT hr;
+
+    if (!init_effect_context(&ctx)) return;
+    hr = ID2D1DeviceContext_CreateBitmap(ctx.context, (D2D1_SIZE_U){1, 1}, &transparent_red,
+            sizeof(transparent_red), &props, &source);
+    ok(hr == S_OK, "Source bitmap creation failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = ID2D1DeviceContext_CreateBitmap(ctx.context, (D2D1_SIZE_U){1, 1}, NULL, 0, &props, &copy);
+        ok(hr == S_OK, "Copy bitmap creation failed, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = ID2D1Bitmap1_CopyFromBitmap(copy, NULL, (ID2D1Bitmap *)source, NULL);
+            ok(hr == S_OK, "Backdrop copy failed, hr %#lx.\n", hr);
+            hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1GaussianBlur, &blur);
+            ok(hr == S_OK, "Blur creation failed, hr %#lx.\n", hr);
+            if (SUCCEEDED(hr))
+            {
+                ID2D1Effect_SetInput(blur, 0, (ID2D1Image *)copy, TRUE);
+                hr = ID2D1Effect_SetValue(blur, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+                        D2D1_PROPERTY_TYPE_FLOAT, (const BYTE *)&(float){0}, sizeof(float));
+                ok(hr == S_OK, "Blur setup failed, hr %#lx.\n", hr);
+                hr = draw_effect(&ctx, blur, NULL, NULL);
+                ok(hr == S_OK, "Backdrop blur draw failed, hr %#lx.\n", hr);
+                if (SUCCEEDED(hr))
+                    check_vector(read_float_pixel(&ctx, 0, 0), (D2D1_VECTOR_4F){1, 0, 0, 1}, .001f);
+                ID2D1Effect_Release(blur);
+            }
+            ID2D1Bitmap1_Release(copy);
+        }
+        ID2D1Bitmap1_Release(source);
+    }
+    cleanup_effect_context(&ctx);
+}
+
 static void test_color_matrix_alpha(void)
 {
     static const D2D1_VECTOR_4F pixel = {.5f, 0, 0, .5f};
@@ -2408,6 +2451,72 @@ static void test_flush_reports_deferred_error(void)
     cleanup_effect_context(&ctx);
 }
 
+struct draw_serialization_test
+{
+    ID2D1DeviceContext *context;
+    HANDLE started;
+    HANDLE entered;
+    HANDLE finish;
+    HRESULT result;
+};
+
+static DWORD WINAPI draw_serialization_thread(void *arg)
+{
+    struct draw_serialization_test *test = arg;
+
+    SetEvent(test->started);
+    ID2D1DeviceContext_BeginDraw(test->context);
+    SetEvent(test->entered);
+    WaitForSingleObject(test->finish, 5000);
+    test->result = ID2D1DeviceContext_EndDraw(test->context, NULL, NULL);
+    return 0;
+}
+
+static void test_context_draw_serialization(void)
+{
+    struct draw_serialization_test test;
+    struct effect_test_context ctx;
+    DWORD wait_result;
+    HANDLE thread;
+    HRESULT hr;
+
+    if (strcmp(winetest_platform, "wine"))
+    {
+        win_skip("Wine compatibility serialization extension.\n");
+        return;
+    }
+    if (!init_effect_context(&ctx)) return;
+    test.context = ctx.context;
+    test.started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    test.entered = CreateEventW(NULL, TRUE, FALSE, NULL);
+    test.finish = CreateEventW(NULL, TRUE, FALSE, NULL);
+    test.result = E_FAIL;
+    ok(!!test.started && !!test.entered && !!test.finish, "Failed to create synchronization events.\n");
+
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    thread = CreateThread(NULL, 0, draw_serialization_thread, &test, 0, NULL);
+    ok(!!thread, "Failed to create draw thread.\n");
+    wait_result = WaitForSingleObject(test.started, 5000);
+    ok(wait_result == WAIT_OBJECT_0, "Draw thread did not start, wait result %#lx.\n", wait_result);
+    wait_result = WaitForSingleObject(test.entered, 100);
+    ok(wait_result == WAIT_TIMEOUT, "Concurrent BeginDraw entered the active drawing session.\n");
+
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Primary EndDraw failed, hr %#lx.\n", hr);
+    wait_result = WaitForSingleObject(test.entered, 5000);
+    ok(wait_result == WAIT_OBJECT_0, "Blocked drawing session did not resume, wait result %#lx.\n", wait_result);
+    SetEvent(test.finish);
+    wait_result = WaitForSingleObject(thread, 5000);
+    ok(wait_result == WAIT_OBJECT_0, "Draw thread did not finish, wait result %#lx.\n", wait_result);
+    ok(test.result == S_OK, "Secondary EndDraw failed, hr %#lx.\n", test.result);
+
+    CloseHandle(thread);
+    CloseHandle(test.finish);
+    CloseHandle(test.entered);
+    CloseHandle(test.started);
+    cleanup_effect_context(&ctx);
+}
+
 #define RUN_EFFECT_TEST(name) run_effect_test(filter, #name, name)
 
 START_TEST(effects)
@@ -2416,7 +2525,9 @@ START_TEST(effects)
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     ok(SUCCEEDED(hr), "CoInitializeEx failed, hr %#lx.\n", hr);
     RUN_EFFECT_TEST(test_fixture);
+    RUN_EFFECT_TEST(test_ignore_alpha_backdrop_blur);
     RUN_EFFECT_TEST(test_flush_reports_deferred_error);
+    RUN_EFFECT_TEST(test_context_draw_serialization);
     RUN_EFFECT_TEST(test_pointwise_effects);
     RUN_EFFECT_TEST(test_color_matrix_alpha);
     RUN_EFFECT_TEST(test_alpha_effects);

@@ -309,6 +309,7 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
         ID2D1Factory_Release(context->factory);
         ID2D1Device6_Release(&context->device->ID2D1Device6_iface);
         d2d_device_indexed_objects_clear(&context->vertex_buffers);
+        DeleteCriticalSection(&context->draw_cs);
         free(context);
     }
 
@@ -2063,8 +2064,14 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
 static void STDMETHODCALLTYPE d2d_device_context_BeginDraw(ID2D1DeviceContext6 *iface)
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    DWORD thread_id = GetCurrentThreadId();
 
     TRACE("iface %p.\n", iface);
+
+    EnterCriticalSection(&context->draw_cs);
+    if (!context->draw_depth)
+        context->draw_thread_id = thread_id;
+    ++context->draw_depth;
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
         d2d_command_list_begin_draw(context->target.command_list, context);
@@ -2076,9 +2083,13 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_EndDraw(ID2D1DeviceContext6 
         D2D1_TAG *tag1, D2D1_TAG *tag2)
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    DWORD thread_id = GetCurrentThreadId();
     HRESULT hr;
 
     TRACE("iface %p, tag1 %p, tag2 %p.\n", iface, tag1, tag2);
+
+    if (!context->draw_depth || context->draw_thread_id != thread_id)
+        return D2DERR_WRONG_STATE;
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
     {
@@ -2100,7 +2111,11 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_EndDraw(ID2D1DeviceContext6 
             context->error.code = hr;
     }
 
-    return context->error.code;
+    hr = context->error.code;
+    if (!--context->draw_depth)
+        context->draw_thread_id = 0;
+    LeaveCriticalSection(&context->draw_cs);
+    return hr;
 }
 
 static D2D1_PIXEL_FORMAT * STDMETHODCALLTYPE d2d_device_context_GetPixelFormat(ID2D1DeviceContext6 *iface,
@@ -5014,6 +5029,7 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
     render_target->IDWriteTextRenderer_iface.lpVtbl = &d2d_text_renderer_vtbl;
     render_target->IUnknown_iface.lpVtbl = &d2d_device_context_inner_unknown_vtbl;
     render_target->refcount = 1;
+    InitializeCriticalSection(&render_target->draw_cs);
     ID2D1Device1_GetFactory((ID2D1Device1 *)&device->ID2D1Device6_iface, &render_target->factory);
     render_target->device = device;
     ID2D1Device6_AddRef(&render_target->device->ID2D1Device6_iface);
@@ -5201,6 +5217,7 @@ err:
         ID3D11Device1_Release(render_target->d3d_device);
     ID2D1Device6_Release(&render_target->device->ID2D1Device6_iface);
     ID2D1Factory_Release(render_target->factory);
+    DeleteCriticalSection(&render_target->draw_cs);
     return hr;
 }
 

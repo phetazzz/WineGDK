@@ -211,6 +211,10 @@ struct d2d_device_context
             [D2D_SAMPLER_EXTEND_MODE_COUNT]
             [D2D_SAMPLER_EXTEND_MODE_COUNT];
 
+    CRITICAL_SECTION draw_cs;
+    DWORD draw_thread_id;
+    unsigned int draw_depth;
+
     struct d2d_error_state error;
     D2D1_DRAWING_STATE_DESCRIPTION1 drawing_state;
     IDWriteRenderingParams *text_rendering_params;
