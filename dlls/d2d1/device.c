@@ -18,6 +18,7 @@
 
 #include "d2d1_private.h"
 #include <d3dcompiler.h>
+#include <float.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
@@ -276,6 +277,8 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
             IDWriteRenderingParams_Release(context->text_rendering_params);
         if (context->bs)
             ID3D11BlendState_Release(context->bs);
+        if (context->copy_bs)
+            ID3D11BlendState_Release(context->copy_bs);
         ID3D11RasterizerState_Release(context->rs);
         ID3D11Buffer_Release(context->vb);
         ID3D11Buffer_Release(context->ib);
@@ -1246,6 +1249,39 @@ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, I
 
     d2d_device_context_FillRectangle(&context->ID2D1DeviceContext6_iface, &d, &brush->ID2D1Brush_iface);
     ID2D1Brush_Release(&brush->ID2D1Brush_iface);
+}
+
+static void d2d_device_context_draw_image_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
+        const D2D1_RECT_F *dst_rect, D2D1_INTERPOLATION_MODE mode, const D2D1_RECT_F *src_rect,
+        const D2D1_POINT_2F *offset, D2D1_COMPOSITE_MODE composite)
+{
+    ID3D11BlendState *saved_bs = context->bs;
+    D3D11_BLEND_DESC desc;
+    HRESULT hr;
+
+    if (composite == D2D1_COMPOSITE_MODE_SOURCE_COPY)
+    {
+        if (!context->copy_bs)
+        {
+            if (!saved_bs)
+            {
+                d2d_device_context_set_error(context, E_FAIL);
+                return;
+            }
+            ID3D11BlendState_GetDesc(saved_bs, &desc);
+            desc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+            desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+            if (FAILED(hr = ID3D11Device1_CreateBlendState(context->d3d_device, &desc, &context->copy_bs)))
+            {
+                d2d_device_context_set_error(context, hr);
+                return;
+            }
+        }
+        context->bs = context->copy_bs;
+    }
+
+    d2d_device_context_draw_bitmap(context, bitmap, dst_rect, 1.0f, mode, src_rect, offset, NULL);
+    context->bs = saved_bs;
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawBitmap(ID2D1DeviceContext6 *iface,
@@ -2599,6 +2635,9 @@ static void d2d_device_context_reset_target(struct d2d_device_context *context)
     if (context->bs)
         ID3D11BlendState_Release(context->bs);
     context->bs = NULL;
+    if (context->copy_bs)
+        ID3D11BlendState_Release(context->copy_bs);
+    context->copy_bs = NULL;
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_SetTarget(ID2D1DeviceContext6 *iface, ID2D1Image *target)
@@ -2990,7 +3029,8 @@ static HRESULT STDMETHODCALLTYPE d2d_replay_DrawImage(ID2D1CommandSink4 *iface, 
 {
     struct d2d_device_context *context = impl_from_ID2D1CommandSink4(iface)->context;
 
-    if (composite != D2D1_COMPOSITE_MODE_SOURCE_OVER || mode > D2D1_INTERPOLATION_MODE_LINEAR)
+    if ((composite != D2D1_COMPOSITE_MODE_SOURCE_OVER && composite != D2D1_COMPOSITE_MODE_SOURCE_COPY)
+            || mode > D2D1_INTERPOLATION_MODE_LINEAR)
         return E_NOTIMPL;
     d2d_device_context_DrawImage(&context->ID2D1DeviceContext6_iface, image, offset, rect, mode, composite);
     return context->error.code;
@@ -3350,12 +3390,14 @@ static HRESULT d2d_device_context_draw_command_list(struct d2d_device_context *c
     float dpi_x = context->desc.dpiX, dpi_y = context->desc.dpiY;
     struct d2d_bitmap *bitmap;
     struct d2d_replay_sink *sink;
+    D2D1_RECT_F copy_bounds;
+    BOOL copy_clip = FALSE;
     float x = offset ? offset->x : 0.0f, y = offset ? offset->y : 0.0f;
     HRESULT hr;
 
     TRACE("context %p, command_list %p, depth %u.\n", context, command_list, context->command_list_depth);
 
-    if (composite != D2D1_COMPOSITE_MODE_SOURCE_OVER)
+    if (composite != D2D1_COMPOSITE_MODE_SOURCE_OVER && composite != D2D1_COMPOSITE_MODE_SOURCE_COPY)
         return E_NOTIMPL;
     /* Also bounds resource use by acyclic but excessively deep command graphs. */
     if (context->command_list_depth >= 32)
@@ -3421,11 +3463,67 @@ static HRESULT d2d_device_context_draw_command_list(struct d2d_device_context *c
     context->clip_stack = clips;
     if (SUCCEEDED(hr))
     {
+        if (composite == D2D1_COMPOSITE_MODE_SOURCE_COPY)
+        {
+            D2D1_RECT_F bounds;
+            unsigned int i;
+
+            hr = d2d_command_list_get_bounds(context, unsafe_impl_from_ID2D1CommandList(command_list),
+                    &bounds, context->command_list_depth);
+            if (SUCCEEDED(hr) && rect) d2d_rect_intersect(&bounds, rect);
+            if (SUCCEEDED(hr) && bounds.right > bounds.left && bounds.bottom > bounds.top)
+            {
+                /* The replay bitmap covers the target, but only the command list's image
+                 * bounds participate in SOURCE_COPY. Transparent pixels elsewhere must
+                 * leave the destination untouched. */
+                if (!isfinite(bounds.left) || !isfinite(bounds.top) || !isfinite(bounds.right)
+                        || !isfinite(bounds.bottom) || bounds.left <= -FLT_MAX / 2
+                        || bounds.top <= -FLT_MAX / 2 || bounds.right >= FLT_MAX / 2
+                        || bounds.bottom >= FLT_MAX / 2)
+                    d2d_rect_set(&copy_bounds, 0, 0, context->pixel_size.width, context->pixel_size.height);
+                else
+                {
+                    for (i = 0; i < 4; ++i)
+                    {
+                        D2D1_POINT_2F point;
+                        float px, py;
+
+                        d2d_point_transform(&point, &state.transform,
+                                (i & 1 ? bounds.right : bounds.left) + x,
+                                (i & 2 ? bounds.bottom : bounds.top) + y);
+                        px = point.x * dpi_x / 96.0f;
+                        py = point.y * dpi_y / 96.0f;
+                        if (!i) d2d_rect_set(&copy_bounds, px, py, px, py);
+                        else
+                        {
+                            copy_bounds.left = min(copy_bounds.left, px);
+                            copy_bounds.top = min(copy_bounds.top, py);
+                            copy_bounds.right = max(copy_bounds.right, px);
+                            copy_bounds.bottom = max(copy_bounds.bottom, py);
+                        }
+                    }
+                    copy_bounds.left = max(0.0f, min(copy_bounds.left, context->pixel_size.width));
+                    copy_bounds.top = max(0.0f, min(copy_bounds.top, context->pixel_size.height));
+                    copy_bounds.right = max(0.0f, min(copy_bounds.right, context->pixel_size.width));
+                    copy_bounds.bottom = max(0.0f, min(copy_bounds.bottom, context->pixel_size.height));
+                }
+                copy_clip = copy_bounds.right > copy_bounds.left && copy_bounds.bottom > copy_bounds.top;
+            }
+        }
+    }
+    if (SUCCEEDED(hr) && (composite != D2D1_COMPOSITE_MODE_SOURCE_COPY || copy_clip))
+    {
         context->drawing_state.transform = identity;
         context->drawing_state.unitMode = D2D1_UNIT_MODE_PIXELS;
         context->desc.dpiX = context->desc.dpiY = 96.0f;
-        d2d_device_context_draw_bitmap(context, (ID2D1Bitmap *)&bitmap->ID2D1Bitmap1_iface, NULL,
-                1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL, NULL, NULL);
+        if (composite != D2D1_COMPOSITE_MODE_SOURCE_COPY
+                || d2d_clip_stack_push(&context->clip_stack, &copy_bounds))
+        {
+            d2d_device_context_draw_image_bitmap(context, (ID2D1Bitmap *)&bitmap->ID2D1Bitmap1_iface, NULL,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL, NULL, composite);
+            if (composite == D2D1_COMPOSITE_MODE_SOURCE_COPY) d2d_clip_stack_pop(&context->clip_stack);
+        }
+        else d2d_device_context_set_error(context, E_OUTOFMEMORY);
         hr = context->error.code;
     }
     context->desc.dpiX = dpi_x;
@@ -3493,7 +3591,7 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
         return;
     }
 
-    if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER)
+    if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER && composite_mode != D2D1_COMPOSITE_MODE_SOURCE_COPY)
         FIXME("Unhandled composite mode %#x.\n", composite_mode);
 
     if (d2d_effect_from_image(image))
@@ -3503,7 +3601,8 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
         float x = target_offset ? target_offset->x : 0;
         float y = target_offset ? target_offset->y : 0;
 
-        if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER)
+        if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER
+                && composite_mode != D2D1_COMPOSITE_MODE_SOURCE_COPY)
         {
             d2d_device_context_set_error(context, E_NOTIMPL);
             return;
@@ -3524,15 +3623,20 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
         src.top -= bounds.top; src.bottom -= bounds.top;
         dst.left += x; dst.right += x; dst.top += y; dst.bottom += y;
         if (dst.right > dst.left && dst.bottom > dst.top)
-            d2d_device_context_draw_bitmap(context, (ID2D1Bitmap *)&result->ID2D1Bitmap1_iface,
-                    &dst, 1.0f, interpolation_mode, &src, NULL, NULL);
+            d2d_device_context_draw_image_bitmap(context, (ID2D1Bitmap *)&result->ID2D1Bitmap1_iface,
+                    &dst, interpolation_mode, &src, NULL, composite_mode);
         ID2D1Bitmap1_Release(&result->ID2D1Bitmap1_iface);
         return;
     }
 
     if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
     {
-        d2d_device_context_draw_bitmap(context, bitmap, NULL, 1.0f, interpolation_mode, image_rect, target_offset, NULL);
+        if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER
+                && composite_mode != D2D1_COMPOSITE_MODE_SOURCE_COPY)
+            d2d_device_context_set_error(context, E_NOTIMPL);
+        else
+            d2d_device_context_draw_image_bitmap(context, bitmap, NULL, interpolation_mode, image_rect,
+                    target_offset, composite_mode);
 
         ID2D1Bitmap_Release(bitmap);
         return;

@@ -1588,14 +1588,6 @@ static HRESULT render_image_internal(struct d2d_device_context *context, ID2D1Im
     /* A collapsed animation frame has no coverage. Do not invert its singular
      * transform and poison the enclosing draw session with E_INVALIDARG. */
     if (empty_rect(bounds)) return create_empty_image(context, result, bounds);
-    if (bounds->left <= -(float)INT_MAX || bounds->top <= -(float)INT_MAX
-            || bounds->right >= (float)INT_MAX || bounds->bottom >= (float)INT_MAX)
-    {
-        bounds->left = max(bounds->left, requested->left);
-        bounds->top = max(bounds->top, requested->top);
-        bounds->right = min(bounds->right, requested->right);
-        bounds->bottom = min(bounds->bottom, requested->bottom);
-    }
     if (!effect)
     {
         if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
@@ -1603,6 +1595,14 @@ static HRESULT render_image_internal(struct d2d_device_context *context, ID2D1Im
             *result = unsafe_impl_from_ID2D1Bitmap(bitmap);
             return S_OK;
         }
+    }
+    bounds->left = max(bounds->left, requested->left);
+    bounds->top = max(bounds->top, requested->top);
+    bounds->right = min(bounds->right, requested->right);
+    bounds->bottom = min(bounds->bottom, requested->bottom);
+    if (empty_rect(bounds)) return create_empty_image(context, result, bounds);
+    if (!effect)
+    {
         if (FAILED(hr = ID2D1Image_QueryInterface(image, &IID_ID2D1CommandList, (void **)&list))) return hr;
         if (SUCCEEDED(hr = create_image(context, bounds, &output)))
             hr = d2d_device_context_rasterize_command_list(context, list, output, bounds);

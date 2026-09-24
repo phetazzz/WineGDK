@@ -212,6 +212,137 @@ static void test_ignore_alpha_backdrop_blur(void)
     cleanup_effect_context(&ctx);
 }
 
+static void test_effect_source_copy_over_background(void)
+{
+    static const D2D1_VECTOR_4F source_pixel = {0, .25f, 0, .25f};
+    static const D2D1_COLOR_F red = {1, 0, 0, 1};
+    static const D2D1_COLOR_F blue = {0, 0, 1, 1};
+    struct effect_test_context ctx;
+    ID2D1Bitmap1 *source;
+    ID2D1Effect *blur;
+    ID2D1CommandList *list;
+    ID2D1Image *output;
+    float sigma = 0;
+    HRESULT hr;
+
+    if (!init_effect_context(&ctx)) return;
+    source = create_float_bitmap(&ctx, 1, 1, &source_pixel);
+    if (!source) { cleanup_effect_context(&ctx); return; }
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1GaussianBlur, &blur);
+    ok(hr == S_OK, "Create blur failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ID2D1Effect_SetInput(blur, 0, (ID2D1Image *)source, TRUE);
+        hr = ID2D1Effect_SetValue(blur, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+                D2D1_PROPERTY_TYPE_FLOAT, (const BYTE *)&sigma, sizeof(sigma));
+        ok(hr == S_OK, "Set sigma failed, hr %#lx.\n", hr);
+        ID2D1Effect_GetOutput(blur, &output);
+        ID2D1DeviceContext_BeginDraw(ctx.context);
+        ID2D1DeviceContext_Clear(ctx.context, &red);
+        ID2D1DeviceContext_DrawImage(ctx.context, output, NULL, NULL,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+        ok(hr == S_OK, "SOURCE_COPY of effect failed, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            check_vector(read_float_pixel(&ctx, 0, 0), source_pixel, .002f);
+            check_vector(read_float_pixel(&ctx, 4, 4), (D2D1_VECTOR_4F){1, 0, 0, 1}, .002f);
+        }
+        hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &list);
+        ok(hr == S_OK, "Create command list failed, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)list);
+            ID2D1DeviceContext_BeginDraw(ctx.context);
+            ID2D1DeviceContext_Clear(ctx.context, &red);
+            ID2D1DeviceContext_DrawImage(ctx.context, output, NULL, NULL,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+            hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+            ok(hr == S_OK, "Record SOURCE_COPY effect failed, hr %#lx.\n", hr);
+            hr = ID2D1CommandList_Close(list);
+            ok(hr == S_OK, "Close command list failed, hr %#lx.\n", hr);
+            ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)ctx.target);
+            ID2D1DeviceContext_BeginDraw(ctx.context);
+            ID2D1DeviceContext_Clear(ctx.context, &blue);
+            ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)list, NULL, NULL,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+            ok(hr == S_OK, "Playback SOURCE_COPY effect failed, hr %#lx.\n", hr);
+            if (SUCCEEDED(hr))
+            {
+                check_vector(read_float_pixel(&ctx, 0, 0), (D2D1_VECTOR_4F){0, .25f, .75f, 1}, .002f);
+                check_vector(read_float_pixel(&ctx, 4, 4), (D2D1_VECTOR_4F){1, 0, 0, 1}, .002f);
+            }
+            ID2D1CommandList_Release(list);
+        }
+        ID2D1Image_Release(output);
+        ID2D1Effect_Release(blur);
+    }
+    ID2D1Bitmap1_Release(source);
+    cleanup_effect_context(&ctx);
+}
+
+static void test_command_list_source_copy_bounds(void)
+{
+    static const D2D1_COLOR_F green = {0, 1, 0, 1}, red = {1, 0, 0, 1};
+    static const D2D1_RECT_F rect = {2, 3, 4, 5};
+    static const D2D1_RECT_F source_rect = {1, 2, 5, 6};
+    static const D2D1_POINT_2F offset = {8, 7};
+    static const D2D1_MATRIX_3X2_F transform = {{{2, 0, 0, 2, 1, 0}}};
+    struct effect_test_context ctx;
+    ID2D1SolidColorBrush *brush = NULL;
+    ID2D1CommandList *list = NULL;
+    D2D1_MATRIX_3X2_F returned;
+    HRESULT hr;
+
+    if (!init_effect_context(&ctx)) return;
+    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
+    ok(hr == S_OK, "Create brush failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &list);
+    ok(hr == S_OK, "Create command list failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)list);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Recording failed, hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(list);
+    ok(hr == S_OK, "Close failed, hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)ctx.target);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &green);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)list, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "SOURCE_COPY command list failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        check_vector(read_float_pixel(&ctx, 2, 3), (D2D1_VECTOR_4F){1, 0, 0, 1}, .002f);
+        check_vector(read_float_pixel(&ctx, 0, 0), (D2D1_VECTOR_4F){0, 1, 0, 1}, .002f);
+        check_vector(read_float_pixel(&ctx, 5, 5), (D2D1_VECTOR_4F){0, 1, 0, 1}, .002f);
+    }
+    ID2D1DeviceContext_SetTransform(ctx.context, &transform);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &green);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)list, &offset, &source_rect,
+            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Transformed SOURCE_COPY command list failed, hr %#lx.\n", hr);
+    ID2D1DeviceContext_GetTransform(ctx.context, &returned);
+    ok(!memcmp(&returned, &transform, sizeof(transform)), "Draw transform was not restored.\n");
+    if (SUCCEEDED(hr))
+    {
+        check_vector(read_float_pixel(&ctx, 19, 17), (D2D1_VECTOR_4F){1, 0, 0, 1}, .002f);
+        check_vector(read_float_pixel(&ctx, 4, 4), (D2D1_VECTOR_4F){0, 1, 0, 1}, .002f);
+        check_vector(read_float_pixel(&ctx, 24, 22), (D2D1_VECTOR_4F){0, 1, 0, 1}, .002f);
+    }
+done:
+    if (list) ID2D1CommandList_Release(list);
+    if (brush) ID2D1SolidColorBrush_Release(brush);
+    cleanup_effect_context(&ctx);
+}
+
 static void test_color_matrix_alpha(void)
 {
     static const D2D1_VECTOR_4F pixel = {.5f, 0, 0, .5f};
@@ -469,6 +600,113 @@ static void test_flood_crop(void)
         ID2D1Effect_Release(crop);
     }
     ID2D1Effect_Release(flood);
+    cleanup_effect_context(&ctx);
+}
+
+static void test_large_finite_effect_clipped_to_target(void)
+{
+    static const D2D1_RECT_F crop_rect = {0, 0, 20000, 768};
+    static const D2D1_VECTOR_4F red = {1, 0, 0, 1};
+    static const D2D1_COLOR_F green = {0, 1, 0, 1};
+    static const D2D1_VECTOR_2F scale_value = {.5f, .5f};
+    struct effect_test_context ctx;
+    ID2D1Effect *flood = NULL, *crop = NULL, *scale = NULL, *blur = NULL;
+    ID2D1Image *input = NULL, *output = NULL;
+    float sigma = 2;
+    HRESULT hr;
+
+    if (!init_effect_context(&ctx)) return;
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Flood, &flood);
+    ok(hr == S_OK, "Create flood failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = ID2D1Effect_SetValue(flood, D2D1_FLOOD_PROP_COLOR, D2D1_PROPERTY_TYPE_VECTOR4,
+            (const BYTE *)&red, sizeof(red));
+    ok(hr == S_OK, "Set flood colour failed, hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Crop, &crop);
+    ok(hr == S_OK, "Create crop failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID2D1Effect_GetOutput(flood, &input);
+    ID2D1Effect_SetInput(crop, 0, input, TRUE);
+    ID2D1Image_Release(input); input = NULL;
+    hr = ID2D1Effect_SetValue(crop, D2D1_CROP_PROP_RECT, D2D1_PROPERTY_TYPE_VECTOR4,
+            (const BYTE *)&crop_rect, sizeof(crop_rect));
+    ok(hr == S_OK, "Set crop bounds failed, hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Scale, &scale);
+    ok(hr == S_OK, "Create scale failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID2D1Effect_GetOutput(crop, &input);
+    ID2D1Effect_SetInput(scale, 0, input, TRUE);
+    ID2D1Image_Release(input); input = NULL;
+    hr = ID2D1Effect_SetValue(scale, D2D1_SCALE_PROP_SCALE, D2D1_PROPERTY_TYPE_VECTOR2,
+            (const BYTE *)&scale_value, sizeof(scale_value));
+    ok(hr == S_OK, "Set scale failed, hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1GaussianBlur, &blur);
+    ok(hr == S_OK, "Create blur failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID2D1Effect_GetOutput(scale, &input);
+    ID2D1Effect_SetInput(blur, 0, input, TRUE);
+    ID2D1Image_Release(input); input = NULL;
+    hr = ID2D1Effect_SetValue(blur, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+            D2D1_PROPERTY_TYPE_FLOAT, (const BYTE *)&sigma, sizeof(sigma));
+    ok(hr == S_OK, "Set blur failed, hr %#lx.\n", hr);
+    ID2D1Effect_GetOutput(blur, &output);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &green);
+    ID2D1DeviceContext_DrawImage(ctx.context, output, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Viewport draw of large finite effect failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        check_vector(read_float_pixel(&ctx, 16, 16), red, .003f);
+done:
+    if (output) ID2D1Image_Release(output);
+    if (input) ID2D1Image_Release(input);
+    if (blur) ID2D1Effect_Release(blur);
+    if (scale) ID2D1Effect_Release(scale);
+    if (crop) ID2D1Effect_Release(crop);
+    if (flood) ID2D1Effect_Release(flood);
+    cleanup_effect_context(&ctx);
+}
+
+static void test_finite_effect_outside_target(void)
+{
+    static const D2D1_RECT_F crop_rect = {100, 100, 20000, 768};
+    static const D2D1_VECTOR_4F red = {1, 0, 0, 1};
+    static const D2D1_COLOR_F green = {0, 1, 0, 1};
+    struct effect_test_context ctx;
+    ID2D1Effect *flood = NULL, *crop = NULL;
+    ID2D1Image *input = NULL, *output = NULL;
+    HRESULT hr;
+
+    if (!init_effect_context(&ctx)) return;
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Flood, &flood);
+    ok(hr == S_OK, "Create flood failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = ID2D1Effect_SetValue(flood, D2D1_FLOOD_PROP_COLOR, D2D1_PROPERTY_TYPE_VECTOR4,
+            (const BYTE *)&red, sizeof(red));
+    ok(hr == S_OK, "Set flood colour failed, hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Crop, &crop);
+    ok(hr == S_OK, "Create crop failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID2D1Effect_GetOutput(flood, &input);
+    ID2D1Effect_SetInput(crop, 0, input, TRUE);
+    ID2D1Image_Release(input); input = NULL;
+    hr = ID2D1Effect_SetValue(crop, D2D1_CROP_PROP_RECT, D2D1_PROPERTY_TYPE_VECTOR4,
+            (const BYTE *)&crop_rect, sizeof(crop_rect));
+    ok(hr == S_OK, "Set crop bounds failed, hr %#lx.\n", hr);
+    ID2D1Effect_GetOutput(crop, &output);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &green);
+    ID2D1DeviceContext_DrawImage(ctx.context, output, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Offscreen effect draw failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr)) check_vector(read_float_pixel(&ctx, 0, 0), (D2D1_VECTOR_4F){0, 1, 0, 1}, .002f);
+done:
+    if (output) ID2D1Image_Release(output);
+    if (input) ID2D1Image_Release(input);
+    if (crop) ID2D1Effect_Release(crop);
+    if (flood) ID2D1Effect_Release(flood);
     cleanup_effect_context(&ctx);
 }
 
@@ -2526,6 +2764,8 @@ START_TEST(effects)
     ok(SUCCEEDED(hr), "CoInitializeEx failed, hr %#lx.\n", hr);
     RUN_EFFECT_TEST(test_fixture);
     RUN_EFFECT_TEST(test_ignore_alpha_backdrop_blur);
+    RUN_EFFECT_TEST(test_effect_source_copy_over_background);
+    RUN_EFFECT_TEST(test_command_list_source_copy_bounds);
     RUN_EFFECT_TEST(test_flush_reports_deferred_error);
     RUN_EFFECT_TEST(test_context_draw_serialization);
     RUN_EFFECT_TEST(test_pointwise_effects);
@@ -2534,6 +2774,8 @@ START_TEST(effects)
     RUN_EFFECT_TEST(test_effect_bounds);
     RUN_EFFECT_TEST(test_brightness);
     RUN_EFFECT_TEST(test_flood_crop);
+    RUN_EFFECT_TEST(test_large_finite_effect_clipped_to_target);
+    RUN_EFFECT_TEST(test_finite_effect_outside_target);
     RUN_EFFECT_TEST(test_shared_graph);
     RUN_EFFECT_TEST(test_two_input_effects);
     RUN_EFFECT_TEST(test_fractional_crop_pixels);
