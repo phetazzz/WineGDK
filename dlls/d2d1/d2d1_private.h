@@ -222,6 +222,10 @@ struct d2d_device_context
 
     struct d2d_indexed_objects vertex_buffers;
     unsigned int command_list_depth;
+    struct d2d_effect_renderer *effect_renderer;
+    struct d2d_effect_bounds_evaluation *effect_bounds_evaluation;
+    struct d2d_effect_image_evaluation *effect_image_evaluation;
+    unsigned int effect_depth;
 };
 
 HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,
@@ -869,6 +873,33 @@ struct d2d_effect
 
 HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
         ID2D1Effect **effect);
+struct d2d_effect *d2d_effect_from_image(ID2D1Image *image);
+HRESULT d2d_color_context_create(ID2D1Factory *factory, D2D1_COLOR_SPACE space,
+        const BYTE *profile, UINT32 size, ID2D1ColorContext **result);
+HRESULT d2d_color_context_from_wic(ID2D1Factory *factory, IWICColorContext *wic, ID2D1ColorContext **result);
+HRESULT d2d_color_context_from_filename(ID2D1Factory *factory, const WCHAR *filename, ID2D1ColorContext **result);
+HRESULT d2d_color_transform_lut(struct d2d_device_context *context, ID2D1ColorContext *source,
+        ID2D1ColorContext *destination, UINT32 source_intent, UINT32 destination_intent, ID2D1LookupTable3D **result);
+HRESULT d2d_lookup_table_create(struct d2d_device_context *context, D2D1_BUFFER_PRECISION precision,
+        const UINT32 *extents, const BYTE *data, UINT32 size, const UINT32 *strides, ID2D1LookupTable3D **result);
+struct d2d_lookup_table
+{
+    ID2D1LookupTable3D ID2D1LookupTable3D_iface;
+    LONG refcount;
+    ID2D1Factory *factory;
+    ID3D11ShaderResourceView *view;
+    UINT32 extents[3];
+};
+struct d2d_lookup_table *d2d_lookup_table_from_iface(ID2D1LookupTable3D *iface);
+HRESULT d2d_effect_set_histogram(struct d2d_effect *effect, const float *values, UINT32 count);
+HRESULT d2d_image_get_bounds(struct d2d_device_context *context, ID2D1Image *image,
+        D2D1_RECT_F *bounds, unsigned int depth);
+HRESULT d2d_effect_render(struct d2d_device_context *context, ID2D1Image *image,
+        const D2D1_POINT_2F *offset, const D2D1_RECT_F *source_rect,
+        struct d2d_bitmap **bitmap, D2D1_RECT_F *bounds);
+void d2d_effect_renderer_destroy(struct d2d_effect_renderer *renderer);
+HRESULT d2d_device_context_rasterize_command_list(struct d2d_device_context *context,
+        ID2D1CommandList *list, struct d2d_bitmap *bitmap, const D2D1_RECT_F *bounds);
 void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
 HRESULT d2d_effect_properties_add(struct d2d_effect_properties *props, const WCHAR *name,
         UINT32 index, D2D1_PROPERTY_TYPE type, const WCHAR *value);
@@ -917,6 +948,8 @@ struct d2d_command_list
 
 HRESULT d2d_command_list_create(ID2D1Factory *factory, struct d2d_command_list **command_list);
 struct d2d_command_list *unsafe_impl_from_ID2D1CommandList(ID2D1CommandList *iface);
+HRESULT d2d_command_list_get_bounds(struct d2d_device_context *context,
+        struct d2d_command_list *list, D2D1_RECT_F *bounds, unsigned int depth);
 void d2d_command_list_begin_draw(struct d2d_command_list *command_list, const struct d2d_device_context *context);
 void d2d_command_list_set_antialias_mode(struct d2d_command_list *command_list, D2D1_ANTIALIAS_MODE mode);
 void d2d_command_list_set_primitive_blend(struct d2d_command_list *command_list,

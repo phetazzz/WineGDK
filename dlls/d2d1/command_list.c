@@ -17,6 +17,7 @@
  */
 
 #include "d2d1_private.h"
+#include <float.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
@@ -489,6 +490,153 @@ static HRESULT STDMETHODCALLTYPE d2d_command_list_Close(ID2D1CommandList *iface)
     if (command_list->target_context)
         ID2D1DeviceContext6_SetTarget(&command_list->target_context->ID2D1DeviceContext6_iface, NULL);
 
+    return S_OK;
+}
+
+HRESULT d2d_command_list_get_bounds(struct d2d_device_context *context,
+        struct d2d_command_list *list, D2D1_RECT_F *bounds, unsigned int depth)
+{
+    D2D1_MATRIX_3X2_F transform = {{{1, 0, 0, 1, 0, 0}}};
+    const BYTE *data = list->data;
+    size_t offset = 0;
+    BOOL has_bounds = FALSE;
+    HRESULT hr = S_OK;
+
+    if (list->state != D2D_COMMAND_LIST_STATE_CLOSED) return D2DERR_WRONG_STATE;
+    if (depth >= 32) return D2DERR_CYCLIC_GRAPH;
+    memset(bounds, 0, sizeof(*bounds));
+    while (offset < list->size)
+    {
+        const struct d2d_command *command = (const void *)(data + offset);
+        D2D1_RECT_F rect = {0};
+        BOOL transformed = FALSE;
+        unsigned int i;
+
+        switch (command->op)
+        {
+            case D2D_COMMAND_SET_TRANSFORM:
+                transform = ((const struct d2d_command_set_transform *)command)->transform;
+                break;
+            case D2D_COMMAND_FILL_RECTANGLE:
+                rect = ((const struct d2d_command_fill_rectangle *)command)->rect;
+                break;
+            case D2D_COMMAND_DRAW_RECTANGLE:
+            {
+                const struct d2d_command_draw_rectangle *c = (const void *)command;
+                ID2D1RectangleGeometry *geometry;
+                if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(list->factory, &c->rect, &geometry))) return hr;
+                hr = ID2D1RectangleGeometry_GetWidenedBounds(geometry, c->stroke_width, c->stroke_style,
+                        &transform, D2D1_DEFAULT_FLATTENING_TOLERANCE, &rect);
+                ID2D1RectangleGeometry_Release(geometry);
+                transformed = TRUE;
+                break;
+            }
+            case D2D_COMMAND_FILL_GEOMETRY:
+            {
+                const struct d2d_command_fill_geometry *c = (const void *)command;
+                hr = ID2D1Geometry_GetBounds(c->geometry, &transform, &rect);
+                transformed = TRUE;
+                break;
+            }
+            case D2D_COMMAND_DRAW_GEOMETRY:
+            {
+                const struct d2d_command_draw_geometry *c = (const void *)command;
+                hr = ID2D1Geometry_GetWidenedBounds(c->geometry, c->stroke_width, c->stroke_style,
+                        &transform, D2D1_DEFAULT_FLATTENING_TOLERANCE, &rect);
+                transformed = TRUE;
+                break;
+            }
+            case D2D_COMMAND_DRAW_LINE:
+            {
+                const struct d2d_command_draw_line *c = (const void *)command;
+                float radius = c->stroke_width * 0.5f;
+                rect.left = min(c->p0.x, c->p1.x) - radius;
+                rect.top = min(c->p0.y, c->p1.y) - radius;
+                rect.right = max(c->p0.x, c->p1.x) + radius;
+                rect.bottom = max(c->p0.y, c->p1.y) + radius;
+                break;
+            }
+            case D2D_COMMAND_DRAW_BITMAP:
+            {
+                const struct d2d_command_draw_bitmap *c = (const void *)command;
+                D2D1_SIZE_F size = ID2D1Bitmap_GetSize(c->bitmap);
+                if (c->perspective_transform) return E_NOTIMPL;
+                if (c->dst_rect) rect = *c->dst_rect;
+                else { rect.right = size.width; rect.bottom = size.height; }
+                break;
+            }
+            case D2D_COMMAND_DRAW_IMAGE:
+            {
+                const struct d2d_command_draw_image *c = (const void *)command;
+                float x = c->target_offset ? c->target_offset->x : 0;
+                float y = c->target_offset ? c->target_offset->y : 0;
+                if (FAILED(hr = d2d_image_get_bounds(context, c->image, &rect, depth + 1))) return hr;
+                if (c->image_rect)
+                {
+                    rect.left = max(rect.left, c->image_rect->left);
+                    rect.top = max(rect.top, c->image_rect->top);
+                    rect.right = min(rect.right, c->image_rect->right);
+                    rect.bottom = min(rect.bottom, c->image_rect->bottom);
+                    x -= c->image_rect->left; y -= c->image_rect->top;
+                }
+                rect.left += x; rect.right += x; rect.top += y; rect.bottom += y;
+                break;
+            }
+            case D2D_COMMAND_DRAW_GLYPH_RUN:
+            {
+                const struct d2d_command_draw_glyph_run *c = (const void *)command;
+                ID2D1PathGeometry *geometry;
+                ID2D1GeometrySink *sink;
+                D2D1_MATRIX_3X2_F m = transform;
+                if (FAILED(hr = ID2D1Factory_CreatePathGeometry(list->factory, &geometry))) return hr;
+                if (SUCCEEDED(hr = ID2D1PathGeometry_Open(geometry, &sink)))
+                {
+                    hr = IDWriteFontFace_GetGlyphRunOutline(c->run.fontFace, c->run.fontEmSize,
+                            c->run.glyphIndices, c->run.glyphAdvances, c->run.glyphOffsets, c->run.glyphCount,
+                            c->run.isSideways, c->run.bidiLevel & 1, (IDWriteGeometrySink *)sink);
+                    if (SUCCEEDED(hr)) hr = ID2D1GeometrySink_Close(sink);
+                    ID2D1GeometrySink_Release(sink);
+                }
+                m._31 += c->origin.x * transform._11 + c->origin.y * transform._21;
+                m._32 += c->origin.x * transform._12 + c->origin.y * transform._22;
+                if (SUCCEEDED(hr)) hr = ID2D1PathGeometry_GetBounds(geometry, &m, &rect);
+                ID2D1PathGeometry_Release(geometry);
+                transformed = TRUE;
+                break;
+            }
+            case D2D_COMMAND_CLEAR:
+                /* Clear contributes an unbounded image even when transparent. */
+                rect.left = rect.top = -FLT_MAX;
+                rect.right = rect.bottom = FLT_MAX;
+                transformed = TRUE;
+                break;
+            case D2D_COMMAND_FILL_MESH:
+            case D2D_COMMAND_FILL_OPACITY_MASK:
+                return E_NOTIMPL;
+            default:
+                break;
+        }
+        if (FAILED(hr)) return hr;
+        if (rect.right > rect.left && rect.bottom > rect.top)
+        {
+            D2D1_RECT_F world = rect;
+            if (!transformed)
+            {
+                for (i = 0; i < 4; ++i)
+                {
+                    D2D1_POINT_2F p;
+                    d2d_point_transform(&p, &transform, i & 1 ? rect.right : rect.left, i & 2 ? rect.bottom : rect.top);
+                    if (!i) { world.left = world.right = p.x; world.top = world.bottom = p.y; }
+                    else { world.left = min(world.left, p.x); world.right = max(world.right, p.x);
+                        world.top = min(world.top, p.y); world.bottom = max(world.bottom, p.y); }
+                }
+            }
+            if (!has_bounds) { *bounds = world; has_bounds = TRUE; }
+            else { bounds->left = min(bounds->left, world.left); bounds->top = min(bounds->top, world.top);
+                bounds->right = max(bounds->right, world.right); bounds->bottom = max(bounds->bottom, world.bottom); }
+        }
+        offset += command->size;
+    }
     return S_OK;
 }
 

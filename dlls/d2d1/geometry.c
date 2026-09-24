@@ -5656,19 +5656,62 @@ static void STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_GetFactory(ID2D1Rou
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_GetBounds(ID2D1RoundedRectangleGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, transform %p, bounds %p stub!\n", iface, transform, bounds);
+    struct d2d_geometry *geometry = impl_from_ID2D1RoundedRectangleGeometry(iface);
+    const D2D1_ROUNDED_RECT *r = &geometry->u.rounded_rectangle.rounded_rect;
+    D2D1_POINT_2F center;
+    float left = min(r->rect.left, r->rect.right), right = max(r->rect.left, r->rect.right);
+    float top = min(r->rect.top, r->rect.bottom), bottom = max(r->rect.top, r->rect.bottom);
+    float width = (right - left) * .5f, height = (bottom - top) * .5f;
+    float rx = min(fabsf(r->radiusX), width), ry = min(fabsf(r->radiusY), height);
+    float extent_x, extent_y;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, bounds %p.\n", iface, transform, bounds);
+    if (!bounds) return E_INVALIDARG;
+    if (!transform) transform = &identity;
+    d2d_point_transform(&center, transform, (left + right) * .5f, (top + bottom) * .5f);
+    /* A rounded rectangle is the sum of its inset rectangle and an ellipse.
+     * Their support functions give tight bounds under rotation and shear. */
+    extent_x = fabsf(transform->_11) * (width - rx) + fabsf(transform->_21) * (height - ry)
+            + hypotf(transform->_11 * rx, transform->_21 * ry);
+    extent_y = fabsf(transform->_12) * (width - rx) + fabsf(transform->_22) * (height - ry)
+            + hypotf(transform->_12 * rx, transform->_22 * ry);
+    bounds->left = center.x - extent_x;
+    bounds->right = center.x + extent_x;
+    bounds->top = center.y - extent_y;
+    bounds->bottom = center.y + extent_y;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_GetWidenedBounds(ID2D1RoundedRectangleGeometry *iface,
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    struct d2d_geometry *geometry = impl_from_ID2D1RoundedRectangleGeometry(iface);
+    const D2D1_ROUNDED_RECT *r = &geometry->u.rounded_rectangle.rounded_rect;
+    float radius = fabsf(stroke_width) * .5f, x, y;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (stroke_style) return E_NOTIMPL;
+    if (FAILED(hr = d2d_rounded_rectangle_geometry_GetBounds(iface, transform, bounds))) return hr;
+    if (!transform) transform = &identity;
+    if (r->radiusX > 0 && r->radiusY > 0)
+    {
+        /* A solid stroke on the smooth boundary is a circular dilation. */
+        x = radius * hypotf(transform->_11, transform->_21);
+        y = radius * hypotf(transform->_12, transform->_22);
+    }
+    else
+    {
+        /* Degenerate corners use the default miter join. */
+        x = radius * (fabsf(transform->_11) + fabsf(transform->_21));
+        y = radius * (fabsf(transform->_12) + fabsf(transform->_22));
+    }
+    bounds->left -= x; bounds->right += x;
+    bounds->top -= y; bounds->bottom += y;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_StrokeContainsPoint(
@@ -5723,36 +5766,47 @@ static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_Simplify(ID2D1Ro
     D2D1_BEZIER_SEGMENT segments[4];
     D2D1_POINT_2F start_point, p;
     D2D1_ELLIPSE ellipse;
+    float left, top, right, bottom, rx, ry;
     bool ret;
 
     TRACE("iface %p, option %#x, transform %p, tolerance %.8e, sink %p.\n",
             iface, option, transform, tolerance, sink);
 
+    left = min(r->rect.left, r->rect.right);
+    top = min(r->rect.top, r->rect.bottom);
+    right = max(r->rect.left, r->rect.right);
+    bottom = max(r->rect.top, r->rect.bottom);
+    rx = max(0.0f, min(r->radiusX, (right - left) * .5f));
+    ry = max(0.0f, min(r->radiusY, (bottom - top) * .5f));
+
+    if (!rx || !ry)
+        return d2d_rectangle_geometry_Simplify((ID2D1RectangleGeometry *)iface, option, transform, tolerance, sink);
+
     d2d_point_set(&ellipse.point, 0.0f, 0.0f);
-    ellipse.radiusX = r->radiusX;
-    ellipse.radiusY = r->radiusY;
+    ellipse.radiusX = rx;
+    ellipse.radiusY = ry;
 
     d2d_ellipse_to_segments(&ellipse, &start_point, segments);
 
-    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.bottom + r->radiusY);
+    d2d_point_set(&p, left + rx, top + ry);
     d2d_point_translate(&start_point, p.x, p.y);
     d2d_bezier_segment_translate(&segments[0], p.x, p.y);
-    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.bottom + r->radiusY);
+    d2d_point_set(&p, right - rx, top + ry);
     d2d_bezier_segment_translate(&segments[1], p.x, p.y);
-    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.top - r->radiusY);
+    d2d_point_set(&p, right - rx, bottom - ry);
     d2d_bezier_segment_translate(&segments[2], p.x, p.y);
-    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.top - r->radiusY);
+    d2d_point_set(&p, left + rx, bottom - ry);
     d2d_bezier_segment_translate(&segments[3], p.x, p.y);
 
     ret = d2d_figure_begin(&figure, start_point, D2D1_FIGURE_BEGIN_FILLED);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[0], 1);
-    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.bottom);
+    d2d_point_set(&p, right - rx, top);
     ret = ret && d2d_figure_add_lines(&figure, &p, 1);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[1], 1);
-    d2d_point_set(&p, r->rect.right, r->rect.top - r->radiusY);
+    d2d_point_set(&p, right, bottom - ry);
     ret = ret && d2d_figure_add_lines(&figure, &p, 1);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[2], 1);
-    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.top);
+    d2d_point_set(&p, left + rx, bottom);
     ret = ret && d2d_figure_add_lines(&figure, &p, 1);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[3], 1);
     if (!ret)
@@ -5873,26 +5927,38 @@ static void d2d_rounded_rectangle_geometry_stream(struct d2d_geometry *geometry,
     const D2D1_ROUNDED_RECT *r = &geometry->u.rounded_rectangle.rounded_rect;
     D2D1_ARC_SEGMENT arcs[4];
     D2D1_POINT_2F points[4];
+    float left, top, right, bottom, rx, ry;
 
-    if (r->radiusX == 0.0f || r->radiusY == 0.0f)
-        return d2d_rectangle_stream(&r->rect, transform, sink);
+    left = min(r->rect.left, r->rect.right);
+    top = min(r->rect.top, r->rect.bottom);
+    right = max(r->rect.left, r->rect.right);
+    bottom = max(r->rect.top, r->rect.bottom);
+    rx = max(0.0f, min(r->radiusX, (right - left) * .5f));
+    ry = max(0.0f, min(r->radiusY, (bottom - top) * .5f));
 
-    arcs[0].size.width = r->radiusX;
-    arcs[0].size.height = r->radiusY;
-    arcs[0].rotationAngle = 90.0f;
+    if (!rx || !ry)
+    {
+        D2D1_RECT_F rect = {left, top, right, bottom};
+
+        return d2d_rectangle_stream(&rect, transform, sink);
+    }
+
+    arcs[0].size.width = rx;
+    arcs[0].size.height = ry;
+    arcs[0].rotationAngle = 0.0f;
     arcs[0].sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
     arcs[0].arcSize = D2D1_ARC_SIZE_SMALL;
     arcs[1] = arcs[2] = arcs[3] = arcs[0];
 
-    d2d_point_set(&points[0], r->rect.left, r->rect.top - r->radiusY);
-    d2d_point_set(&points[1], r->rect.right - r->radiusX, r->rect.top);
-    d2d_point_set(&points[2], r->rect.right, r->rect.bottom - r->radiusY);
-    d2d_point_set(&points[3], r->rect.left - r->radiusX, r->rect.bottom);
+    d2d_point_set(&points[0], left, top + ry);
+    d2d_point_set(&points[1], right - rx, top);
+    d2d_point_set(&points[2], right, bottom - ry);
+    d2d_point_set(&points[3], left + rx, bottom);
 
-    d2d_point_set(&arcs[0].point, r->rect.left - r->radiusX, r->rect.top);
-    d2d_point_set(&arcs[1].point, r->rect.right, r->rect.top - r->radiusY);
-    d2d_point_set(&arcs[2].point, r->rect.right - r->radiusX, r->rect.bottom);
-    d2d_point_set(&arcs[3].point, r->rect.left, r->rect.bottom - r->radiusY);
+    d2d_point_set(&arcs[0].point, left + rx, top);
+    d2d_point_set(&arcs[1].point, right, top + ry);
+    d2d_point_set(&arcs[2].point, right - rx, bottom);
+    d2d_point_set(&arcs[3].point, left, bottom - ry);
 
     if (transform)
     {

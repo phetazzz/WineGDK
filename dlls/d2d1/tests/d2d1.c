@@ -5170,8 +5170,13 @@ static void test_rectangle_geometry(BOOL d3d11)
 static void test_rounded_rectangle_geometry(BOOL d3d11)
 {
     ID2D1RoundedRectangleGeometry *geometry;
+    ID2D1GeometryGroup *group;
+    ID2D1Geometry *geometries[1];
+    struct geometry_sink sink;
     D2D1_ROUNDED_RECT rect, rect2;
+    D2D1_RECT_F bounds;
     struct d2d1_test_context ctx;
+    BOOL match;
     HRESULT hr;
 
     if (!init_test_context(&ctx, d3d11))
@@ -5208,6 +5213,52 @@ static void test_rounded_rectangle_geometry(BOOL d3d11)
     ID2D1RoundedRectangleGeometry_GetRoundedRect(geometry, &rect2);
     ok(!memcmp(&rect, &rect2, sizeof(rect)), "Got unexpected rectangle {%.8e, %.8e, %.8e, %.8e, %.8e, %.8e}.\n",
             rect2.rect.left, rect2.rect.top, rect2.rect.right, rect2.rect.bottom, rect2.radiusX, rect2.radiusY);
+    ID2D1RoundedRectangleGeometry_Release(geometry);
+
+    /* Streaming a rounded rectangle into a path must keep every point inside the source rectangle. */
+    set_rounded_rect(&rect, 10.0f, 20.0f, 110.0f, 70.0f, 10.0f, 8.0f);
+    hr = ID2D1Factory_CreateRoundedRectangleGeometry(ctx.factory, &rect, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    geometries[0] = (ID2D1Geometry *)geometry;
+    hr = ID2D1Factory_CreateGeometryGroup(ctx.factory, D2D1_FILL_MODE_ALTERNATE, geometries, 1, &group);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1GeometryGroup_GetBounds(group, NULL, &bounds);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    match = compare_rect(&bounds, 10.0f, 20.0f, 110.0f, 70.0f, 1);
+    ok(match, "Got unexpected streamed bounds {%.8e, %.8e, %.8e, %.8e}.\n",
+            bounds.left, bounds.top, bounds.right, bounds.bottom);
+    ID2D1GeometryGroup_Release(group);
+
+    geometry_sink_init(&sink);
+    hr = ID2D1RoundedRectangleGeometry_Simplify(geometry, D2D1_GEOMETRY_SIMPLIFICATION_OPTION_CUBICS_AND_LINES,
+            NULL, 0.0f, (ID2D1SimplifiedGeometrySink *)&sink.ID2D1GeometrySink_iface);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(sink.figure_count == 1, "Got unexpected figure count %u.\n", sink.figure_count);
+    if (sink.figure_count)
+    {
+        unsigned int i;
+
+        ok(sink.figures[0].start_point.x >= rect.rect.left && sink.figures[0].start_point.x <= rect.rect.right
+                && sink.figures[0].start_point.y >= rect.rect.top && sink.figures[0].start_point.y <= rect.rect.bottom,
+                "Start point {%.8e, %.8e} is outside the rounded rectangle.\n",
+                sink.figures[0].start_point.x, sink.figures[0].start_point.y);
+        for (i = 0; i < sink.figures[0].segment_count; ++i)
+        {
+            const struct geometry_segment *segment = &sink.figures[0].segments[i];
+            D2D1_POINT_2F point;
+
+            if (segment->type == SEGMENT_LINE)
+                point = segment->u.line;
+            else if (segment->type == SEGMENT_BEZIER)
+                point = segment->u.bezier.point3;
+            else
+                continue;
+            ok(point.x >= rect.rect.left && point.x <= rect.rect.right
+                    && point.y >= rect.rect.top && point.y <= rect.rect.bottom,
+                    "Segment %u endpoint {%.8e, %.8e} is outside the rounded rectangle.\n", i, point.x, point.y);
+        }
+    }
+    geometry_sink_cleanup(&sink);
     ID2D1RoundedRectangleGeometry_Release(geometry);
 
     release_test_context(&ctx);
@@ -10663,6 +10714,386 @@ static ID2D1DeviceContext *create_device_context(ID2D1Factory1 *factory, IDXGIDe
     return device_context;
 }
 
+static void test_effect_images(BOOL d3d11)
+{
+    static const D2D1_COLOR_F green = {0, 1, 0, 1}, red = {1, 0, 0, 1};
+    static const D2D1_RECT_F rect = {16, 16, 32, 32};
+    static const D2D1_VECTOR_4F blue_shadow = {0, 0, 1, 1};
+    D2D1_MATRIX_3X2_F translation = {{{1, 0, 0, 1, 24, 0}}};
+    D2D1_VECTOR_2F scale_value = {2, 2};
+    ID2D1Effect *crop, *scale, *blur, *shadow, *affine, *composite;
+    ID2D1SolidColorBrush *brush;
+    ID2D1Image *target, *output, *input;
+    ID2D1CommandList *list;
+    struct d2d1_test_context ctx;
+    struct resource_readback rb;
+    D2D1_RECT_F bounds;
+    float sigma = 1, zero = 0;
+    DWORD colour;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11)) return;
+    if (!ctx.factory1)
+    {
+        win_skip("Effects are not supported.\n");
+        release_test_context(&ctx);
+        return;
+    }
+    ID2D1DeviceContext_GetTarget(ctx.context, &target);
+    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)list);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, target);
+
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Crop, &crop);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1Effect_SetInput(crop, 0, (ID2D1Image *)list, TRUE);
+    hr = ID2D1Effect_SetValue(crop, D2D1_CROP_PROP_RECT, D2D1_PROPERTY_TYPE_VECTOR4,
+            (const BYTE *)&rect, sizeof(rect));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Scale, &scale);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1Effect_GetOutput(crop, &input);
+    ID2D1Effect_SetInput(scale, 0, input, TRUE);
+    ID2D1Image_Release(input);
+    hr = ID2D1Effect_SetValue(scale, D2D1_SCALE_PROP_SCALE, D2D1_PROPERTY_TYPE_VECTOR2,
+            (const BYTE *)&scale_value, sizeof(scale_value));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1GaussianBlur, &blur);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1Effect_GetOutput(scale, &input);
+    ID2D1Effect_SetInput(blur, 0, input, TRUE);
+    ID2D1Image_Release(input);
+    hr = ID2D1Effect_SetValue(blur, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_PROPERTY_TYPE_FLOAT,
+            (const BYTE *)&sigma, sizeof(sigma));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1Effect_GetOutput(blur, &output);
+    hr = ID2D1DeviceContext_GetImageLocalBounds(ctx.context, output, &bounds);
+    ok(hr == S_OK, "Bounds failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr)) ok(compare_rect(&bounds, 29, 29, 67, 67, 0), "Unexpected blur bounds.\n");
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &green);
+    ID2D1DeviceContext_DrawImage(ctx.context, output, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Blur chain failed, hr %#lx.\n", hr);
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 48, 48);
+    ok(colour == 0xffff0000, "Blur centre %#lx.\n", colour);
+    colour = get_readback_colour(&rb, 31, 48);
+    ok((colour & 0xff0000) && (colour & 0xff00), "Blur halo missing, colour %#lx.\n", colour);
+    colour = get_readback_colour(&rb, 4, 4);
+    ok(colour == 0xff00ff00, "Background changed, colour %#lx.\n", colour);
+    release_resource_readback(&rb);
+    ID2D1Image_Release(output);
+
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Shadow, &shadow);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1Effect_SetInput(shadow, 0, (ID2D1Image *)list, TRUE);
+    hr = ID2D1Effect_SetValue(shadow, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, D2D1_PROPERTY_TYPE_FLOAT,
+            (const BYTE *)&zero, sizeof(zero));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1Effect_SetValue(shadow, D2D1_SHADOW_PROP_COLOR, D2D1_PROPERTY_TYPE_VECTOR4,
+            (const BYTE *)&blue_shadow, sizeof(blue_shadow));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D12DAffineTransform, &affine);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1Effect_GetOutput(shadow, &input);
+    ID2D1Effect_SetInput(affine, 0, input, TRUE);
+    ID2D1Image_Release(input);
+    hr = ID2D1Effect_SetValue(affine, D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX, D2D1_PROPERTY_TYPE_MATRIX_3X2,
+            (const BYTE *)&translation, sizeof(translation));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1Composite, &composite);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ID2D1Effect_GetOutput(affine, &input);
+    ID2D1Effect_SetInput(composite, 0, input, TRUE);
+    ID2D1Image_Release(input);
+    ID2D1Effect_SetInput(composite, 1, (ID2D1Image *)list, TRUE);
+    ID2D1Effect_GetOutput(composite, &output);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &green);
+    ID2D1DeviceContext_DrawImage(ctx.context, output, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Shadow chain failed, hr %#lx.\n", hr);
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 24, 24);
+    ok(colour == 0xffff0000, "Original content missing, colour %#lx.\n", colour);
+    colour = get_readback_colour(&rb, 48, 24);
+    ok(colour == 0xff0000ff, "Translated shadow missing, colour %#lx.\n", colour);
+    release_resource_readback(&rb);
+    ID2D1Image_Release(output);
+    ID2D1Effect_Release(composite);
+    ID2D1Effect_Release(affine);
+    ID2D1Effect_Release(shadow);
+    ID2D1Effect_Release(blur);
+    ID2D1Effect_Release(scale);
+    ID2D1Effect_Release(crop);
+    ID2D1CommandList_Release(list);
+    ID2D1SolidColorBrush_Release(brush);
+    ID2D1Image_Release(target);
+    release_test_context(&ctx);
+}
+
+static void test_command_list_layers(BOOL d3d11)
+{
+    static const D2D1_MATRIX_3X2_F identity = {{{1, 0, 0, 1, 0, 0}}};
+    static const D2D1_COLOR_F green = {0, 1, 0, 1}, red = {1, 0, 0, 1};
+    static const D2D1_COLOR_F half = {1, 1, 1, 0.5f};
+    static const D2D1_RECT_F rect = {0, 0, 64, 64};
+    D2D1_ROUNDED_RECT rounded = {{8, 8, 40, 40}, 8, 8};
+    D2D1_LAYER_PARAMETERS1 params;
+    D2D1_MATRIX_3X2_F transform, returned;
+    ID2D1SolidColorBrush *brush, *opacity;
+    ID2D1RoundedRectangleGeometry *mask;
+    struct d2d1_test_context ctx;
+    struct resource_readback rb;
+    ID2D1CommandList *list;
+    ID2D1Image *target;
+    unsigned int i;
+    DWORD colour, expected;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11)) return;
+    if (!ctx.factory1)
+    {
+        win_skip("Command lists are not supported.\n");
+        release_test_context(&ctx);
+        return;
+    }
+    ID2D1DeviceContext_GetTarget(ctx.context, &target);
+    hr = ID2D1Factory_CreateRoundedRectangleGeometry(ctx.factory, &rounded, &mask);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &half, NULL, &opacity);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    for (i = 0; i < 5; ++i)
+    {
+        winetest_push_context("layer case %u, d3d11 %u", i, d3d11);
+        ID2D1DeviceContext_SetTransform(ctx.context, &identity);
+        hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &list);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)list);
+        ID2D1DeviceContext_BeginDraw(ctx.context);
+        memset(&params, 0, sizeof(params));
+        params.contentBounds = rect;
+        if (i == 0)
+            set_rect(&params.contentBounds, -FLT_MAX, -FLT_MAX, FLT_MAX, FLT_MAX);
+        params.geometricMask = (ID2D1Geometry *)mask;
+        params.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+        params.maskTransform = identity;
+        params.maskTransform._31 = 4;
+        params.opacity = i == 1 || i == 2 ? 0.5f : 1.0f;
+        params.opacityBrush = i == 3 ? (ID2D1Brush *)opacity : NULL;
+        transform = identity;
+        transform._31 = 16;
+        ID2D1DeviceContext_SetTransform(ctx.context, &transform);
+        ID2D1DeviceContext_PushLayer(ctx.context, &params, NULL);
+        if (i == 2)
+        {
+            params.geometricMask = NULL;
+            params.contentBounds.right = 32;
+            ID2D1DeviceContext_PushLayer(ctx.context, &params, NULL);
+        }
+        /* Layer opacity must apply once to the group, not to each overlapping draw. */
+        ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+        ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+        if (i == 2) ID2D1DeviceContext_PopLayer(ctx.context);
+        if (i == 4)
+        {
+            /* An unsupported command inside an open layer must unwind its target. */
+            ID2D1DeviceContext_SetPrimitiveBlend(ctx.context, D2D1_PRIMITIVE_BLEND_COPY);
+        }
+        ID2D1DeviceContext_SetTransform(ctx.context, &identity);
+        ID2D1DeviceContext_PopLayer(ctx.context);
+        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+        ok(hr == S_OK, "Recording failed, hr %#lx.\n", hr);
+        hr = ID2D1CommandList_Close(list);
+        ok(hr == S_OK, "Close failed, hr %#lx.\n", hr);
+        ID2D1DeviceContext_SetPrimitiveBlend(ctx.context, D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        ID2D1DeviceContext_SetTarget(ctx.context, target);
+        ID2D1DeviceContext_BeginDraw(ctx.context);
+        ID2D1DeviceContext_Clear(ctx.context, &green);
+        ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)list, NULL, NULL,
+                D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+        if (i == 4)
+            todo_wine ok(hr == S_OK, "Playback failed, hr %#lx.\n", hr);
+        else
+            ok(hr == S_OK, "Playback failed, hr %#lx.\n", hr);
+        ID2D1DeviceContext_GetTransform(ctx.context, &returned);
+        ok(!memcmp(&returned, &identity, sizeof(identity)), "Transform not restored.\n");
+        get_surface_readback(&ctx, &rb);
+        colour = get_readback_colour(&rb, 36, 24);
+        expected = i == 2 ? 0xff40bf00 : i == 1 || i == 3 ? 0xff807f00 : 0xffff0000;
+        if (i != 4) ok(compare_colour(colour, expected, 1), "Centre colour %#lx, expected %#lx.\n", colour, expected);
+        else if (FAILED(hr)) ok(colour == 0xff00ff00, "Failed playback altered the destination, colour %#lx.\n", colour);
+        colour = get_readback_colour(&rb, 28, 8);
+        ok(colour == 0xff00ff00, "Rounded corner not masked, colour %#lx.\n", colour);
+        colour = get_readback_colour(&rb, 4, 4);
+        ok(colour == 0xff00ff00, "Background changed, colour %#lx.\n", colour);
+        if (i == 2)
+        {
+            colour = get_readback_colour(&rb, 52, 24);
+            ok(colour == 0xff00ff00, "Nested content bounds lost, colour %#lx.\n", colour);
+        }
+        release_resource_readback(&rb);
+        refcount = ID2D1CommandList_Release(list);
+        ok(!refcount, "List has %lu references.\n", refcount);
+        /* The original target must still work after both success and failure. */
+        ID2D1DeviceContext_BeginDraw(ctx.context);
+        ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+        ok(hr == S_OK, "Subsequent drawing failed, hr %#lx.\n", hr);
+        get_surface_readback(&ctx, &rb);
+        colour = get_readback_colour(&rb, 4, 4);
+        ok(colour == 0xffff0000, "Subsequent drawing targeted the wrong bitmap, colour %#lx.\n", colour);
+        release_resource_readback(&rb);
+        winetest_pop_context();
+    }
+    ID2D1Image_Release(target);
+    ID2D1SolidColorBrush_Release(brush);
+    ID2D1SolidColorBrush_Release(opacity);
+    refcount = ID2D1RoundedRectangleGeometry_Release(mask);
+    ok(!refcount, "Mask has %lu references.\n", refcount);
+    release_test_context(&ctx);
+}
+
+static void test_command_list_ignore_alpha(BOOL d3d11)
+{
+    static const D2D1_COLOR_F background = {0.0f, 1.0f, 0.0f, 1.0f};
+    static const D2D1_COLOR_F transparent = {0.0f, 0.0f, 0.0f, 0.0f};
+    static const D2D1_COLOR_F red = {1.0f, 0.0f, 0.0f, 1.0f};
+    static const D2D1_RECT_F rect = {0.0f, 0.0f, 16.0f, 16.0f};
+    D2D1_BITMAP_PROPERTIES1 properties = {{DXGI_FORMAT_B8G8R8A8_UNORM,
+            D2D1_ALPHA_MODE_IGNORE}, 96.0f, 96.0f,
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW, NULL};
+    struct d2d1_test_context ctx;
+    ID2D1SolidColorBrush *brush;
+    ID2D1CommandList *list;
+    ID2D1Bitmap1 *target;
+    ID2D1Image *returned_target;
+    struct resource_readback rb;
+    D2D1_PIXEL_FORMAT format;
+    D2D1_SIZE_U size;
+    unsigned int i, x, y, mismatches;
+    DWORD expected, colour;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+    if (!ctx.factory1)
+    {
+        win_skip("Command lists are not supported.\n");
+        release_test_context(&ctx);
+        return;
+    }
+
+    hr = ID2D1DeviceContext_CreateBitmapFromDxgiSurface(ctx.context, ctx.surface, &properties, &target);
+    ok(hr == S_OK, "Failed to create IGNORE-alpha target, hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        release_test_context(&ctx);
+        return;
+    }
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)target);
+    format = ID2D1DeviceContext_GetPixelFormat(ctx.context);
+    ok(format.format == properties.pixelFormat.format && format.alphaMode == D2D1_ALPHA_MODE_IGNORE,
+            "Unexpected target format %#x, alpha mode %#x.\n", format.format, format.alphaMode);
+    size = ID2D1Bitmap1_GetPixelSize(target);
+    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
+    ok(hr == S_OK, "Failed to create brush, hr %#lx.\n", hr);
+
+    /* Empty, Clear(NULL), explicit transparent clear, rectangle, clear + rectangle. */
+    for (i = 0; i < 5; ++i)
+    {
+        winetest_push_context("case %u, d3d11 %u", i, d3d11);
+        hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &list);
+        ok(hr == S_OK, "Failed to create command list, hr %#lx.\n", hr);
+        ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)list);
+        ID2D1DeviceContext_BeginDraw(ctx.context);
+        ID2D1DeviceContext_SetAntialiasMode(ctx.context, D2D1_ANTIALIAS_MODE_ALIASED);
+        if (i == 1 || i == 4)
+            ID2D1DeviceContext_Clear(ctx.context, NULL);
+        else if (i == 2)
+            ID2D1DeviceContext_Clear(ctx.context, &transparent);
+        if (i >= 3)
+            ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
+        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+        ok(hr == S_OK, "Recording failed, hr %#lx.\n", hr);
+        hr = ID2D1CommandList_Close(list);
+        ok(hr == S_OK, "Close failed, hr %#lx.\n", hr);
+
+        ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)target);
+        ID2D1DeviceContext_BeginDraw(ctx.context);
+        ID2D1DeviceContext_Clear(ctx.context, &background);
+        ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)list, NULL, NULL,
+                D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+        ok(hr == S_OK, "Playback failed, hr %#lx.\n", hr);
+        format = ID2D1DeviceContext_GetPixelFormat(ctx.context);
+        ok(format.format == properties.pixelFormat.format && format.alphaMode == D2D1_ALPHA_MODE_IGNORE,
+                "Target format was not restored, format %#x, alpha mode %#x.\n", format.format, format.alphaMode);
+        ID2D1DeviceContext_GetTarget(ctx.context, &returned_target);
+        ok(returned_target == (ID2D1Image *)target, "Target was not restored.\n");
+        if (returned_target) ID2D1Image_Release(returned_target);
+
+        get_surface_readback(&ctx, &rb);
+        mismatches = 0;
+        for (y = 0; y < size.height; ++y)
+        {
+            for (x = 0; x < size.width; ++x)
+            {
+                expected = i >= 3 && x < 16 && y < 16 ? 0xffff0000 : 0xff00ff00;
+                colour = get_readback_colour(&rb, x, y);
+                if (colour != expected) ++mismatches;
+            }
+        }
+        ok(!mismatches, "%u pixels differ from the expected rectangle / unchanged green background.\n", mismatches);
+        release_resource_readback(&rb);
+        refcount = ID2D1CommandList_Release(list);
+        ok(!refcount, "Command list has %lu references left.\n", refcount);
+        winetest_pop_context();
+    }
+
+    /* Stream failure must also restore the IGNORE-alpha destination. */
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &list);
+    ok(hr == S_OK, "Failed to create command list, hr %#lx.\n", hr);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_Clear(ctx.context, &background);
+    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)list, NULL, NULL,
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(FAILED(hr), "Expected an unclosed list error.\n");
+    format = ID2D1DeviceContext_GetPixelFormat(ctx.context);
+    ok(format.format == properties.pixelFormat.format && format.alphaMode == D2D1_ALPHA_MODE_IGNORE,
+            "Target format was not restored on failure, format %#x, alpha mode %#x.\n",
+            format.format, format.alphaMode);
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 32, 32);
+    ok(colour == 0xff00ff00, "Failed playback altered background, colour %#lx.\n", colour);
+    release_resource_readback(&rb);
+    ID2D1CommandList_Release(list);
+    ID2D1SolidColorBrush_Release(brush);
+    ID2D1DeviceContext_SetTarget(ctx.context, NULL);
+    refcount = ID2D1Bitmap1_Release(target);
+    ok(!refcount, "Target has %lu references left.\n", refcount);
+    release_test_context(&ctx);
+}
+
 static HRESULT STDMETHODCALLTYPE command_list_sink_BeginDraw(ID2D1CommandSink *iface)
 {
     return E_ABORT;
@@ -13719,7 +14150,6 @@ static void test_effect_2d_affine(BOOL d3d11)
         ID2D1Effect_GetOutput(effect, &output);
 
         hr = ID2D1DeviceContext_GetImageLocalBounds(context, output, &output_bounds);
-        todo_wine
         ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
         todo_wine
         ok(compare_rect(&output_bounds, test->bounds.left, test->bounds.top, test->bounds.right, test->bounds.bottom, 1),
@@ -13858,9 +14288,7 @@ static void test_effect_crop(BOOL d3d11)
 
         set_rect(&output_bounds, -1.0f, -1.0f, -1.0f, -1.0f);
         hr = ID2D1DeviceContext_GetImageLocalBounds(context, output, &output_bounds);
-        todo_wine
         ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-        todo_wine
         ok(compare_rect(&output_bounds, test->bounds.left, test->bounds.top, test->bounds.right, test->bounds.bottom, 0),
                 "Got unexpected output bounds {%.8e, %.8e, %.8e, %.8e}, expected {%.8e, %.8e, %.8e, %.8e}.\n",
                 output_bounds.left, output_bounds.top, output_bounds.right, output_bounds.bottom,
@@ -13943,7 +14371,7 @@ static void test_effect_grayscale(BOOL d3d11)
                 + 0.587f * ((pixel >> 8) & 0xff)
                 + 0.114f * ((pixel >> 0) & 0xff) + 0.5f);
         expected_colour = (pixel & 0xff000000) | (luminance << 16) | (luminance << 8) | luminance;
-        todo_wine ok(compare_colour(colour, expected_colour, 1),
+        todo_wine_if(i != 0) ok(compare_colour(colour, expected_colour, 1),
                 "Got unexpected colour %#lx, expected %#lx.\n", colour, expected_colour);
         release_resource_readback(&rb);
 
@@ -14314,9 +14742,7 @@ static void test_effect_flood(BOOL d3d11)
     ID2D1Effect_GetOutput(effect, &output);
 
     hr = ID2D1DeviceContext_GetImageLocalBounds(context, output, &bounds);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    todo_wine
     ok(compare_rect(&bounds, -bound, -bound, bound, bound, 0),
             "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n",
             bounds.left, bounds.top, bounds.right, bounds.bottom);
@@ -14337,7 +14763,6 @@ static void test_effect_flood(BOOL d3d11)
     hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     match = compare_surface(&ctx, "6527ec83b4039c895b50f9b3e144fe0cf90d1889");
-    todo_wine
     ok(match, "Surface does not match.\n");
 
     ID2D1Image_Release(output);
@@ -18456,6 +18881,9 @@ START_TEST(d2d1)
     queue_d3d10_test(test_skew_matrix);
     queue_test(test_command_list);
     queue_test(test_command_list_draw);
+    queue_test(test_command_list_ignore_alpha);
+    queue_test(test_command_list_layers);
+    queue_test(test_effect_images);
     queue_d3d10_test(test_max_bitmap_size);
     queue_test(test_dpi);
     queue_test(test_unit_mode);
