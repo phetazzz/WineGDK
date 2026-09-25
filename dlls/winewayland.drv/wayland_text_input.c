@@ -33,12 +33,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(imm);
 
+/* The installed Proton win32u still has WINE_IME_PROCESS_KEY at index 0. */
+#define PROTON_WINE_IME_POST_UPDATE 2
+
 static void post_ime_update(HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR *result_str)
 {
     /* Windows uses an empty string to clear the composition string. */
     if (!comp_str && !result_str) comp_str = (WCHAR *)L"";
 
-    NtUserMessageCall(hwnd, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str, result_str,
+    NtUserMessageCall(hwnd, PROTON_WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str, result_str,
             NtUserImeDriverCall, FALSE);
 }
 

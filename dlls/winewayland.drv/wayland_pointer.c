@@ -325,6 +325,13 @@ static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_point
     pointer_handle_axis_value120(data, wl_pointer, axis, WHEEL_DELTA * discrete);
 }
 
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
+static void pointer_handle_axis_relative_direction(void *data, struct wl_pointer *wl_pointer,
+                                                   uint32_t axis, uint32_t direction)
+{
+}
+#endif
+
 static const struct wl_pointer_listener pointer_listener =
 {
     pointer_handle_enter,
@@ -337,7 +344,10 @@ static const struct wl_pointer_listener pointer_listener =
     pointer_handle_axis_stop,
     pointer_handle_axis_discrete,
 #ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
-    pointer_handle_axis_value120
+    pointer_handle_axis_value120,
+#endif
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
+    pointer_handle_axis_relative_direction,
 #endif
 };
 

@@ -140,8 +140,15 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
             return;
         }
         pthread_mutex_lock(&seat->mutex);
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
         seat->wl_seat = wl_registry_bind(registry, id, &wl_seat_interface,
                                          version < 8 ? version : 8);
+#else
+        /* wl_seat.get_pointer inherits the seat version.  Don't request
+         * pointer events that the build's wl_pointer_listener cannot handle. */
+        seat->wl_seat = wl_registry_bind(registry, id, &wl_seat_interface,
+                                         version < 7 ? version : 7);
+#endif
         seat->global_id = id;
         wl_seat_add_listener(seat->wl_seat, &seat_listener, NULL);
         pthread_mutex_unlock(&seat->mutex);
