@@ -4799,9 +4799,23 @@ static void STDMETHODCALLTYPE d2d_ellipse_geometry_GetFactory(ID2D1EllipseGeomet
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_GetBounds(ID2D1EllipseGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, transform %p, bounds %p stub!\n", iface, transform, bounds);
+    const struct d2d_geometry *geometry = impl_from_ID2D1EllipseGeometry(iface);
+    const D2D1_ELLIPSE *ellipse = &geometry->u.ellipse.ellipse;
+    D2D1_POINT_2F center;
+    float extent_x, extent_y;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, bounds %p.\n", iface, transform, bounds);
+
+    if (!bounds) return E_INVALIDARG;
+    if (!transform) transform = &identity;
+    d2d_point_transform(&center, transform, ellipse->point.x, ellipse->point.y);
+    extent_x = hypotf(transform->_11 * ellipse->radiusX, transform->_21 * ellipse->radiusY);
+    extent_y = hypotf(transform->_12 * ellipse->radiusX, transform->_22 * ellipse->radiusY);
+    bounds->left = center.x - extent_x;
+    bounds->right = center.x + extent_x;
+    bounds->top = center.y - extent_y;
+    bounds->bottom = center.y + extent_y;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_GetWidenedBounds(ID2D1EllipseGeometry *iface,

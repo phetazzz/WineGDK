@@ -2550,6 +2550,85 @@ static void test_rounded_geometry_effect(void)
     cleanup_effect_context(&ctx);
 }
 
+static void test_ellipse_command_list_blur(void)
+{
+    static const D2D1_ELLIPSE ellipse = {{16, 16}, 8, 4};
+    static const D2D1_COLOR_F red = {1, 0, 0, 1};
+    static const D2D1_MATRIX_3X2_F transform = {{{0, 1, -1, 0, 32, 0}}};
+    static const D2D1_MATRIX_3X2_F shear = {{{1, 0, 1, 1, 0, 0}}};
+    struct effect_test_context ctx;
+    ID2D1EllipseGeometry *geometry = NULL;
+    ID2D1SolidColorBrush *brush = NULL;
+    ID2D1CommandList *list = NULL;
+    ID2D1Effect *blur = NULL;
+    D2D1_RECT_F bounds;
+    float sigma = 1;
+    HRESULT hr;
+
+    if (!init_effect_context(&ctx)) return;
+    hr = ID2D1Factory1_CreateEllipseGeometry(ctx.factory, &ellipse, &geometry);
+    ok(hr == S_OK, "Create ellipse failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = ID2D1EllipseGeometry_GetBounds(geometry, NULL, &bounds);
+    ok(hr == S_OK, "Untransformed ellipse bounds failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        ok(bounds.left == 8 && bounds.top == 12 && bounds.right == 24 && bounds.bottom == 20,
+                "Unexpected untransformed ellipse bounds {%g,%g,%g,%g}.\n",
+                bounds.left, bounds.top, bounds.right, bounds.bottom);
+    hr = ID2D1EllipseGeometry_GetBounds(geometry, &transform, &bounds);
+    ok(hr == S_OK, "Ellipse bounds failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        ok(fabsf(bounds.left - 12) < .001f && fabsf(bounds.top - 8) < .001f
+                && fabsf(bounds.right - 20) < .001f && fabsf(bounds.bottom - 24) < .001f,
+                "Unexpected ellipse bounds {%g,%g,%g,%g}.\n",
+                bounds.left, bounds.top, bounds.right, bounds.bottom);
+    hr = ID2D1EllipseGeometry_GetBounds(geometry, &shear, &bounds);
+    ok(hr == S_OK, "Sheared ellipse bounds failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        ok(fabsf(bounds.left - 23.055728f) < .001f && bounds.top == 12
+                && fabsf(bounds.right - 40.944272f) < .001f && bounds.bottom == 20,
+                "Unexpected sheared ellipse bounds {%g,%g,%g,%g}.\n",
+                bounds.left, bounds.top, bounds.right, bounds.bottom);
+    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
+    ok(hr == S_OK, "Create brush failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &list);
+    ok(hr == S_OK, "Create list failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)list);
+    ID2D1DeviceContext_BeginDraw(ctx.context);
+    ID2D1DeviceContext_FillGeometry(ctx.context, (ID2D1Geometry *)geometry, (ID2D1Brush *)brush, NULL);
+    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
+    ok(hr == S_OK, "Record ellipse failed, hr %#lx.\n", hr);
+    hr = ID2D1CommandList_Close(list);
+    ok(hr == S_OK, "Close list failed, hr %#lx.\n", hr);
+    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)ctx.target);
+    if (FAILED(hr)) goto done;
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_D2D1GaussianBlur, &blur);
+    ok(hr == S_OK, "Create blur failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID2D1Effect_SetInput(blur, 0, (ID2D1Image *)list, TRUE);
+    hr = ID2D1Effect_SetValue(blur, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+            D2D1_PROPERTY_TYPE_FLOAT, (const BYTE *)&sigma, sizeof(sigma));
+    ok(hr == S_OK, "Set blur failed, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = draw_effect(&ctx, blur, NULL, NULL);
+    ok(hr == S_OK, "Ellipse-list blur failed, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        D2D1_VECTOR_4F pixel = read_float_pixel(&ctx, 16, 16);
+        ok(pixel.x > .95f && pixel.w > .95f, "Ellipse center missing: {%g,%g,%g,%g}.\n",
+                pixel.x, pixel.y, pixel.z, pixel.w);
+    }
+done:
+    ID2D1DeviceContext_SetTarget(ctx.context, NULL);
+    if (blur) ID2D1Effect_Release(blur);
+    if (list) ID2D1CommandList_Release(list);
+    if (brush) ID2D1SolidColorBrush_Release(brush);
+    if (geometry) ID2D1EllipseGeometry_Release(geometry);
+    cleanup_effect_context(&ctx);
+}
+
 static void test_animated_blur_timing(void)
 {
     struct effect_test_context ctx;
@@ -2820,6 +2899,7 @@ START_TEST(effects)
     RUN_EFFECT_TEST(test_camera_plane_crossing);
     RUN_EFFECT_TEST(test_animated_effect_transform);
     RUN_EFFECT_TEST(test_rounded_geometry_effect);
+    RUN_EFFECT_TEST(test_ellipse_command_list_blur);
     RUN_EFFECT_TEST(test_gaussian_animation_pixels);
     if (filter) RUN_EFFECT_TEST(test_animated_blur_timing);
     if (SUCCEEDED(hr)) CoUninitialize();
