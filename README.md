@@ -1,3 +1,127 @@
+## BedrockOnLinux で Vector を動かす場合
+
+このブランチは、Linux 上の Minecraft Bedrock で Vector クライアントを動かすための WineGDK 修正版です。
+
+- **`d2d1`**: Vector の描画に必要なコマンドリスト画像、各種エフェクト、カラーコンテキストに対応しました。多重描画の同期や範囲計算も手を入れています。ワールド全体が真っ黒になる問題は直っていますが、NameTags のちらつきはまだ調査中です。
+- **`winewayland.drv`**: 新しめの Wayland 環境（Hyprland など）でポインタやクリップボードのイベントを取りこぼして落ちる問題を直しました。また、GDK-Proton 側の `win32u.so` とやり取りする内部番号を合わせています。これで Super+ドラッグでウィンドウサイズを変えてもクラッシュしなくなりました。
+
+以下は **BedrockOnLinux が使う GDK-Proton** に修正済みバイナリを組み込む手順です。システム全体の Wine を書き換えるものではありません。元の WineGDK の説明は後半に残してあります。
+
+### 1. 準備と環境の確認
+
+ビルドには一般的な C コンパイラ、GNU make、Wayland の開発用ヘッダー、32bit 向けツールチェーン（32bit DLL もビルドする場合）が必要です。具体的なパッケージ名はディストリビューションごとに異なるので、下にある元の README や Wine 公式の案内を見て入れておいてください。
+
+**【重要】Wayland ドライバの互換性について**
+`winewayland.so` は Wine 本体の奥深く（`win32u.so`）と強い結びつきがあります。導入先 GDK-Proton のベースとなった Wine ソースと一致していないと、シンボル不足や内部番号の食い違いでクラッシュします。よく分からない場合は `d2d1.dll` だけを導入し、Wayland ドライバの差し替えは見送るのが無難です。
+
+まず、この README がある WineGDK のルートディレクトリで変数を設定します（bash で実行してください）。
+
+```bash
+set -euo pipefail
+SRC="$(pwd)"
+BOL_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/bedrock-on-linux"
+PROTON_DIR="$BOL_DATA/proton/<使用中のGDK-Protonディレクトリ名>"
+BUILD64="$HOME/build/winegdk-vector-win64"
+BUILD32="$HOME/build/winegdk-vector-win32"
+PREFIX="$BOL_DATA/compatdata/pfx"
+
+test -f "$SRC/configure"
+test -f "$PROTON_DIR/files/lib/wine/x86_64-unix/win32u.so"
+```
+
+`<使用中のGDK-Protonディレクトリ名>` は、実際にランチャーで選んでいるディレクトリ名（例: `GDK-Proton-xuser` など）に変えてください。
+
+### 2. ソース外で必要なモジュールをビルドする
+
+ソースディレクトリを汚さないよう、別の場所で configure して必要な DLL だけビルドします。
+
+```bash
+mkdir -p "$BUILD64" "$BUILD32"
+(cd "$BUILD64" && "$SRC/configure" --enable-win64 --disable-tests)
+(cd "$BUILD32" && "$SRC/configure" --disable-tests)
+
+make -C "$BUILD64" -j"$(nproc)" dlls/d2d1/all dlls/winewayland.drv/all
+make -C "$BUILD32" -j"$(nproc)" dlls/d2d1/all
+```
+
+ビルドされるファイルは次の通りです。
+- 64bit D2D: `"$BUILD64/dlls/d2d1/x86_64-windows/d2d1.dll"`
+- 32bit D2D: `"$BUILD32/dlls/d2d1/i386-windows/d2d1.dll"`
+- Wayland ドライバ: `"$BUILD64/dlls/winewayland.drv/winewayland.so"`
+
+※32bit ツールチェーンがなくて 32bit 側がコケる場合は、32bit の手順は飛ばして 64bit のみ導入してください。
+
+ビルドした Wayland ドライバを使う場合は、導入先とリンクできるか事前に確認しておきます（エラーが出なければ OK です）。
+
+```bash
+LD_LIBRARY_PATH="$PROTON_DIR/files/lib/wine/x86_64-unix" \
+    ldd -r "$BUILD64/dlls/winewayland.drv/winewayland.so"
+```
+
+### 3. バックアップを取って配置する
+
+**必ずゲームを終了した状態で作業してください。**
+後から元に戻せるよう、タイムスタンプ付きのディレクトリに元ファイルを退避してから上書きします。
+
+```bash
+WINE_LIB="$PROTON_DIR/files/lib/wine"
+BACKUP_DIR="$HOME/winegdk-vector-backup-$(date +%Y%m%d-%H%M%S)"
+PREFIX_DLL64="$PREFIX/drive_c/windows/system32/d2d1.dll"
+PREFIX_DLL32="$PREFIX/drive_c/windows/syswow64/d2d1.dll"
+
+# 元ファイルの存在確認
+test -f "$BUILD64/dlls/d2d1/x86_64-windows/d2d1.dll"
+test -f "$WINE_LIB/x86_64-windows/d2d1.dll"
+
+mkdir "$BACKUP_DIR"
+
+# 64bit D2D をバックアップ & 上書き
+cp -p "$WINE_LIB/x86_64-windows/d2d1.dll" "$BACKUP_DIR/d2d1-x86_64.dll"
+cp -p "$BUILD64/dlls/d2d1/x86_64-windows/d2d1.dll" "$WINE_LIB/x86_64-windows/d2d1.dll"
+
+# prefix 側にも実体があれば同期
+if test -f "$PREFIX_DLL64"; then
+    cp -p "$PREFIX_DLL64" "$BACKUP_DIR/prefix-d2d1-x86_64.dll"
+    cp -p "$BUILD64/dlls/d2d1/x86_64-windows/d2d1.dll" "$PREFIX_DLL64"
+fi
+
+# 32bit D2D（ビルドした場合のみ）
+if test -f "$BUILD32/dlls/d2d1/i386-windows/d2d1.dll" && test -f "$WINE_LIB/i386-windows/d2d1.dll"; then
+    cp -p "$WINE_LIB/i386-windows/d2d1.dll" "$BACKUP_DIR/d2d1-i386.dll"
+    cp -p "$BUILD32/dlls/d2d1/i386-windows/d2d1.dll" "$WINE_LIB/i386-windows/d2d1.dll"
+    if test -f "$PREFIX_DLL32"; then
+        cp -p "$PREFIX_DLL32" "$BACKUP_DIR/prefix-d2d1-i386.dll"
+        cp -p "$BUILD32/dlls/d2d1/i386-windows/d2d1.dll" "$PREFIX_DLL32"
+    fi
+fi
+
+# Wayland ドライバ（互換性を確認できた場合のみ）
+if test -f "$BUILD64/dlls/winewayland.drv/winewayland.so" && test -f "$WINE_LIB/x86_64-unix/winewayland.so"; then
+    cp -p "$WINE_LIB/x86_64-unix/winewayland.so" "$BACKUP_DIR/winewayland.so"
+    cp -p "$BUILD64/dlls/winewayland.drv/winewayland.so" "$WINE_LIB/x86_64-unix/winewayland.so"
+fi
+```
+
+### 元に戻したいとき
+
+もし動作がおかしくなった場合は、ゲームを閉じてからバックアップしたファイルを元の位置へ書き戻してください。
+
+```bash
+cp -p "$BACKUP_DIR/d2d1-x86_64.dll" "$WINE_LIB/x86_64-windows/d2d1.dll"
+if test -f "$BACKUP_DIR/d2d1-i386.dll"; then
+    cp -p "$BACKUP_DIR/d2d1-i386.dll" "$WINE_LIB/i386-windows/d2d1.dll"
+fi
+if test -f "$BACKUP_DIR/prefix-d2d1-x86_64.dll"; then
+    cp -p "$BACKUP_DIR/prefix-d2d1-x86_64.dll" "$PREFIX_DLL64"
+fi
+if test -f "$BACKUP_DIR/prefix-d2d1-i386.dll"; then
+    cp -p "$BACKUP_DIR/prefix-d2d1-i386.dll" "$PREFIX_DLL32"
+fi
+if test -f "$BACKUP_DIR/winewayland.so"; then
+    cp -p "$BACKUP_DIR/winewayland.so" "$WINE_LIB/x86_64-unix/winewayland.so"
+fi
+```
+
 # NOTES FOR PEOPLE TRYING TO RUN MINECRAFT'S GDK BUILD
 
 Microsoft Services is WIP.
